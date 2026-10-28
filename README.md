@@ -21,6 +21,13 @@ docker compose up -d postgres redis
 go run .
 ```
 
+With a Redis primary, two replicas and three Sentinels instead of a single
+Redis:
+
+```sh
+docker compose -f compose.yaml -f compose.sentinel.yaml up -d --build
+```
+
 ## API
 
 Create a link. `expires_in` is in seconds and optional; without it the link
@@ -60,7 +67,8 @@ without a user name or password, and not pointing to the shortener itself.
 | `ADDR`             | `:8080`                                                        |
 | `BASE_URL`         | `http://localhost:8080`, used to build short URLs              |
 | `DATABASE_URL`     | `postgres://redshortener:redshortener@localhost:5432/redshortener` |
-| `REDIS_ADDR`       | `localhost:6379`                                               |
+| `REDIS_ADDR`       | `localhost:6379`; comma-separated Sentinels with `REDIS_MASTER` |
+| `REDIS_MASTER`     | empty; the Sentinel master name to go through Sentinel         |
 | `CLIENT_IP_HEADER` | empty: rate limit by the TCP peer address                      |
 
 Behind a reverse proxy, every request comes from the proxy, so all clients
@@ -202,13 +210,104 @@ Redis is a cache, so its failure should make the service slower, not
 unavailable:
 
 - Lookups that fail in Redis go to Postgres, still through `singleflight`.
-- The Redis client gives up after 200 ms per read or write and 1 second to
-  connect, with one retry. With the go-redis defaults, a hung Redis would delay
-  every redirect by several seconds.
+- Every Redis command or pipeline gets 300 ms in total, dialing and the one
+  retry included. The budget is a go-redis hook that sets a context deadline,
+  and `ContextTimeoutEnabled` makes the deadline apply to socket reads and
+  writes as well.
 - `/readyz` only checks Postgres, so a load balancer keeps sending traffic.
 - The rate limiter, [redlimit](https://github.com/eduardperreca/redlimit),
   fails open: link creation is not limited while Redis is down.
 - Clicks are not counted.
+
+A budget is needed because per-step timeouts do not add up to a bound. The
+first version set a 1 second dial timeout, 200 ms read and write timeouts and
+one retry, which looks like at most a few hundred milliseconds. But go-redis
+also retries dialing 5 times per attempt, each time with the full dial
+timeout. When the Redis primary was stopped during a test, a rate-limited
+create spent 5 seconds dialing, retried, spent 5 more, and was cut off by the
+server's 10 second write timeout.
+
+### Redis replicas
+
+With `REDIS_MASTER` set, the app asks the Sentinels in `REDIS_ADDR` where the
+primary is and reads links from the replicas. Redis replicates asynchronously:
+the primary answers a write before the replicas have it.
+
+#### Which command goes where
+
+The client is a go-redis failover cluster client with `ReplicaOnly`. It treats
+the primary and its replicas as one shard of a cluster, sends commands that
+Redis flags as read-only to a replica, and everything else to the primary.
+
+| Command                        | Node    |
+| ------------------------------ | ------- |
+| `GET link:{code}`              | replica |
+| `SET`, `SET NX`, `HINCRBY`     | primary |
+| `MULTI` (click flush)          | primary |
+| `EVALSHA` (rate limiter)       | primary |
+
+This was checked with `INFO commandstats` on each node: 50 redirects gave 25
+`GET`s on each replica and none on the primary.
+
+The obvious configuration does something else. `NewUniversalClient` with a
+`MasterName` and `ReadOnly: true` returns a plain failover client with
+`ReplicaOnly`, which connects only to replicas and sends them the writes too.
+Those fail with `READONLY`. Routing by command needs
+`NewFailoverClusterClient`, or `RouteRandomly`, which spreads reads over the
+primary and the replicas.
+
+#### Stale reads
+
+A read from a replica can return an older value than the primary holds. Here
+that matters in two places:
+
+- A link read right after it is created can miss on the replica. That costs
+  one Postgres query, then the link is cached.
+- If a code was probed in the last 60 seconds, the replica can still hold the
+  negative entry after the primary has replaced it with the new link. The link
+  then reads as not found until the replica catches up.
+
+In practice the window is small. 10,000 rounds of `SET` on the primary followed
+right away by `GET` on a replica, from the same client, found the key on the
+replica every time, also with 8 other connections writing 100 KB values to the
+primary. Redis sends a write to its replicas in the same event loop iteration
+as the reply to the client, so a stale read needs a replication link that is
+slower than the client's own round trip to the replica: a replica in another
+zone, a congested network, or a replica that is still resyncing.
+
+Replicas never delete expired keys on their own; they wait for the `DEL` from
+the primary. They do answer reads of a key that is past its TTL as if it did
+not exist, so a link whose cache entry has expired is not served from a
+replica.
+
+#### Failover
+
+Stopping the primary while sending a redirect and a create every 100 ms:
+
+- The Sentinels agreed the primary was down after 5 seconds
+  (`down-after-milliseconds`) and promoted a replica 1.2 seconds later.
+- All 202 redirects and all 202 creates succeeded. Redirects kept hitting the
+  cache on the replicas.
+- From 2 to 8 seconds after the stop, each write to Redis used its whole 300
+  ms budget, so redirects took up to 310 ms, creates up to 630 ms, and the loop
+  went from 6 iterations a second to 1. Clicks and rate limiting stopped for
+  those seconds. The app needed about 2 seconds after the promotion to send
+  writes to the new primary.
+- When the old primary came back, Sentinel made it a replica of the new one.
+
+Two things can go wrong in a failover that did not show in this test:
+
+- Writes the old primary accepted but had not sent to a replica are lost. For
+  the cache that means misses. For the click flush it is worse: if the primary
+  answers `MULTI { HGETALL, DEL }` and dies before the `DEL` reaches a replica,
+  the new primary still has the counts, and they are flushed a second time.
+  `WAIT 1 <timeout>` after the flush would make the app wait for a replica to
+  confirm the `DEL`, which narrows this window but does not close it.
+- Redis runs without persistence here. If a primary restarts fast enough that
+  Sentinel has not yet failed over, it comes back empty, and the replicas
+  resync from it and empty themselves too. For a cache that means a cold start
+  and lost click counts. If the data mattered, the primary would need
+  persistence, or must not be restarted automatically.
 
 ### Redis configuration
 
@@ -260,7 +359,7 @@ Without the two variables, only the tests that need no database run.
 
 ## Roadmap
 
-- v0.2: Redis Sentinel, with redirects read from Redis replicas.
+- v0.2: Redis Sentinel, with redirects read from Redis replicas. Done.
 - v0.3: a Postgres streaming replica for reads, and the read-your-writes
   problem it brings: a link created on the primary and missed on a lagging
   replica reads as not found.
@@ -273,6 +372,8 @@ Without the two variables, only the tests that need no database run.
 - Nishtala et al., [Scaling Memcache at Facebook](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala), NSDI 2013. Leases, stale sets and thundering herds.
 - Vattani, Chierichetti, Lowenstein, [Optimal Probabilistic Cache Stampede Prevention](https://doi.org/10.14778/2757807.2757813), PVLDB 8(8), 2015.
 - Redis, [Key eviction](https://redis.io/docs/latest/develop/reference/eviction/).
+- Redis, [Replication](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/), including the safety of replication when the primary has persistence turned off.
+- Redis, [High availability with Sentinel](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/).
 - PostgreSQL, [Heap-Only Tuples](https://www.postgresql.org/docs/current/storage-hot.html).
 
 ## License
