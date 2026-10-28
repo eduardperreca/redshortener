@@ -1,0 +1,118 @@
+// Command redshortener is a URL shortener that keeps links in Postgres.
+package main
+
+import (
+	"context"
+	"embed"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+//go:embed migrations/*.sql
+var migrations embed.FS
+
+func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	if err := run(); err != nil {
+		slog.Error("exiting", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	base, err := url.Parse(env("BASE_URL", "http://localhost:8080"))
+	if err != nil || base.Host == "" {
+		return fmt.Errorf("BASE_URL must be an absolute URL, got %q", os.Getenv("BASE_URL"))
+	}
+
+	db, err := pgxpool.New(ctx, env("DATABASE_URL", "postgres://redshortener:redshortener@localhost:5432/redshortener"))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := migrate(ctx, db); err != nil {
+		return fmt.Errorf("migrating: %w", err)
+	}
+
+	links := &Links{db: db}
+	srv := &http.Server{
+		Addr:              env("ADDR", ":8080"),
+		Handler:           newHandler(links, base),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       time.Minute,
+	}
+
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServe() }()
+	slog.Info("listening", "addr", srv.Addr, "base_url", base.String())
+
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+	}
+	slog.Info("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return srv.Shutdown(shutdownCtx)
+}
+
+// migrate applies the files in migrations/ that have not been applied yet, in
+// name order, all in one transaction. The advisory lock makes instances that
+// start at the same time wait for each other instead of racing.
+func migrate(ctx context.Context, db *pgxpool.Pool) error {
+	files, err := fs.Glob(migrations, "migrations/*.sql")
+	if err != nil {
+		return err
+	}
+	return pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('redshortener migrate'))`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+			name       text PRIMARY KEY,
+			applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+			return err
+		}
+		for _, name := range files {
+			tag, err := tx.Exec(ctx, `INSERT INTO schema_migrations (name) VALUES ($1) ON CONFLICT DO NOTHING`, name)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				continue // already applied
+			}
+			sql, err := migrations.ReadFile(name)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, string(sql)); err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+			slog.Info("applied migration", "name", name)
+		}
+		return nil
+	})
+}
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
