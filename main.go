@@ -71,19 +71,29 @@ func run() error {
 		IdleTimeout:       time.Minute,
 	}
 
+	done := make(chan struct{})
+	go func() {
+		links.background(ctx)
+		close(done)
+	}()
+
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
 	slog.Info("listening", "addr", srv.Addr, "base_url", base.String())
 
 	select {
 	case err := <-errc:
+		stop()
+		<-done
 		return err
 	case <-ctx.Done():
 	}
 	slog.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	err = srv.Shutdown(shutdownCtx)
+	<-done
+	return err
 }
 
 // migrate applies the files in migrations/ that have not been applied yet, in

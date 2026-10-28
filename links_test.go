@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,6 +62,40 @@ func TestCacheAside(t *testing.T) {
 	}
 	if got := l.rdb.Get(ctx, cacheKey(link.Code)).Val(); got != link.URL {
 		t.Fatalf("cache after miss: got %q", got)
+	}
+}
+
+// Ten instances flushing at once must count every click exactly once.
+func TestConcurrentFlush(t *testing.T) {
+	l := newLinks(t)
+	ctx := context.Background()
+
+	link, err := l.Create(ctx, "https://example.com/", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			for range 10 {
+				l.Hit(ctx, link.Code)
+				if err := l.flushClicks(ctx); err != nil {
+					t.Error(err)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if err := l.flushClicks(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := l.Stats(ctx, link.Code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Clicks != 100 {
+		t.Fatalf("got %d clicks, want 100", got.Clicks)
 	}
 }
 

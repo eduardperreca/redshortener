@@ -136,7 +136,7 @@ func (l *Links) load(ctx context.Context, code string) (string, error) {
 	return url, nil
 }
 
-// Stats returns the stored link.
+// Stats returns the stored link. Clicks lag behind by up to one flush interval.
 func (l *Links) Stats(ctx context.Context, code string) (Link, error) {
 	link := Link{Code: code}
 	err := l.db.QueryRow(ctx, `
@@ -147,6 +147,13 @@ func (l *Links) Stats(ctx context.Context, code string) (Link, error) {
 		return Link{}, errNotFound
 	}
 	return link, err
+}
+
+func (l *Links) deleteExpired(ctx context.Context) error {
+	// ponytail: one DELETE for every expired row; batch it with LIMIT if a
+	// backlog ever makes the statement hold locks for too long.
+	_, err := l.db.Exec(ctx, `DELETE FROM links WHERE expires_at <= now()`)
+	return err
 }
 
 // ttlFor jitters base by ±10%, so links cached together do not all expire

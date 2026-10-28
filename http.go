@@ -82,8 +82,9 @@ func newHandler(links *Links, base *url.URL) http.Handler {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		// 302, not 301: browsers cache a 301 forever, so an expired link
-		// would keep redirecting.
+		links.Hit(r.Context(), code)
+		// 302, not 301: browsers cache a 301 forever, so later clicks would
+		// not be counted and an expired link would keep redirecting.
 		http.Redirect(w, r, target, http.StatusFound)
 	})
 
