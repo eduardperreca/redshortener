@@ -64,7 +64,7 @@ func run() error {
 	links := &Links{db: db, rdb: rdb}
 	srv := &http.Server{
 		Addr:              env("ADDR", ":8080"),
-		Handler:           newHandler(links, base),
+		Handler:           newHandler(links, base, os.Getenv("CLIENT_IP_HEADER")),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

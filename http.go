@@ -4,18 +4,32 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/eduardperreca/redlimit"
 )
 
 const maxExpiresIn = 10 * 365 * 24 * time.Hour
 
-// newHandler serves the API.
-func newHandler(links *Links, base *url.URL) http.Handler {
+// newHandler serves the API. Client addresses for rate
+// limiting come from ipHeader when it is set, and from the TCP connection
+// otherwise.
+func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
+	// 10 links at once, then one a second, per client address.
+	limit := redlimit.Middleware(redlimit.NewTokenBucket(links.rdb, 1, 10), func(r *http.Request) string {
+		if ip := r.Header.Get(ipHeader); ipHeader != "" && ip != "" {
+			return ip
+		}
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		return host
+	})
+
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /api/links", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("POST /api/links", limit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			URL       string `json:"url"`
 			ExpiresIn int64  `json:"expires_in"` // seconds; 0 never expires
@@ -45,7 +59,7 @@ func newHandler(links *Links, base *url.URL) http.Handler {
 			Link
 			ShortURL string `json:"short_url"`
 		}{link, base.JoinPath(link.Code).String()})
-	})
+	})))
 
 	mux.HandleFunc("GET /api/links/{code}", func(w http.ResponseWriter, r *http.Request) {
 		code := r.PathValue("code")
