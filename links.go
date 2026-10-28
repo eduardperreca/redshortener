@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -20,6 +21,7 @@ const (
 	codeLen     = 7
 	cacheTTL    = 24 * time.Hour
 	negativeTTL = time.Minute
+	loadTimeout = 5 * time.Second
 )
 
 var errNotFound = errors.New("link not found")
@@ -36,6 +38,7 @@ type Link struct {
 type Links struct {
 	db  *pgxpool.Pool
 	rdb redis.UniversalClient
+	sf  singleflight.Group
 }
 
 func cacheKey(code string) string { return "link:" + code }
@@ -88,7 +91,20 @@ func (l *Links) Resolve(ctx context.Context, code string) (string, error) {
 	default:
 		slog.WarnContext(ctx, "reading cache", "code", code, "err", err)
 	}
-	return l.load(ctx, code)
+
+	// Concurrent misses on one code share a single query, so a popular link
+	// dropping out of the cache sends one query per instance, not one per
+	// request. The query outlives the first caller's context, because the
+	// other callers are waiting on it too.
+	v, err, _ := l.sf.Do(code, func() (any, error) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), loadTimeout)
+		defer cancel()
+		return l.load(ctx, code)
+	})
+	if err != nil {
+		return "", err
+	}
+	return v.(string), nil
 }
 
 // load reads code from Postgres and caches the answer, including "not found".
