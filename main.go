@@ -50,8 +50,14 @@ func run() error {
 		return fmt.Errorf("migrating: %w", err)
 	}
 
+	// Short timeouts: when Redis hangs, a lookup should give up and go to
+	// Postgres, not wait out the defaults of several seconds.
 	rdb := redis.NewUniversalClient(&redis.UniversalOptions{
-		Addrs: strings.Split(env("REDIS_ADDR", "localhost:6379"), ","),
+		Addrs:        strings.Split(env("REDIS_ADDR", "localhost:6379"), ","),
+		DialTimeout:  time.Second,
+		ReadTimeout:  200 * time.Millisecond,
+		WriteTimeout: 200 * time.Millisecond,
+		MaxRetries:   1,
 	})
 	defer rdb.Close()
 

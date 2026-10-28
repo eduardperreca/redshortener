@@ -88,6 +88,8 @@ func newHandler(links *Links, base *url.URL) http.Handler {
 	})
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {})
+	// Redis is only a cache: without it lookups go to Postgres. So only
+	// Postgres decides whether this instance is ready.
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		if err := links.db.Ping(r.Context()); err != nil {
 			http.Error(w, "postgres: "+err.Error(), http.StatusServiceUnavailable)
