@@ -4,17 +4,21 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"log/slog"
+	mrand "math/rand/v2"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
 	alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 	codeLen  = 7
+	cacheTTL = 24 * time.Hour
 )
 
 var errNotFound = errors.New("link not found")
@@ -27,10 +31,13 @@ type Link struct {
 	Clicks    int64      `json:"clicks"`
 }
 
-// Links stores links in Postgres.
+// Links stores links in Postgres and caches lookups in Redis.
 type Links struct {
-	db *pgxpool.Pool
+	db  *pgxpool.Pool
+	rdb redis.UniversalClient
 }
+
+func cacheKey(code string) string { return "link:" + code }
 
 // Create stores url under a new random code. A zero expiresIn means the link
 // never expires.
@@ -58,16 +65,45 @@ func (l *Links) Create(ctx context.Context, url string, expiresIn time.Duration)
 	return Link{}, errors.New("no free code after 3 attempts")
 }
 
-// Resolve returns the URL behind code.
+// Resolve returns the URL behind code, from Redis when cached and from
+// Postgres otherwise. If Redis fails, lookups go to Postgres.
 func (l *Links) Resolve(ctx context.Context, code string) (string, error) {
+	url, err := l.rdb.Get(ctx, cacheKey(code)).Result()
+	switch {
+	case err == nil:
+		return url, nil
+	case errors.Is(err, redis.Nil):
+		// not cached
+	default:
+		slog.WarnContext(ctx, "reading cache", "code", code, "err", err)
+	}
+	return l.load(ctx, code)
+}
+
+// load reads code from Postgres and caches the answer.
+func (l *Links) load(ctx context.Context, code string) (string, error) {
 	var url string
+	var left *float64 // seconds until expiry, read from the Postgres clock
 	err := l.db.QueryRow(ctx, `
-		SELECT url FROM links
-		WHERE code = $1 AND (expires_at IS NULL OR expires_at > now())`, code).Scan(&url)
+		SELECT url, extract(epoch FROM expires_at - now())::float8 FROM links
+		WHERE code = $1 AND (expires_at IS NULL OR expires_at > now())`, code).Scan(&url, &left)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", errNotFound
 	}
-	return url, err
+	if err != nil {
+		return "", err
+	}
+
+	var expiresIn time.Duration
+	if left != nil {
+		expiresIn = time.Duration(*left * float64(time.Second))
+	}
+	if ttl := ttlFor(cacheTTL, expiresIn); ttl >= time.Millisecond {
+		if err := l.rdb.Set(ctx, cacheKey(code), url, ttl).Err(); err != nil {
+			slog.WarnContext(ctx, "caching link", "code", code, "err", err)
+		}
+	}
+	return url, nil
 }
 
 // Stats returns the stored link.
@@ -81,6 +117,16 @@ func (l *Links) Stats(ctx context.Context, code string) (Link, error) {
 		return Link{}, errNotFound
 	}
 	return link, err
+}
+
+// ttlFor jitters base by ±10%, so links cached together do not all expire
+// and miss together, and caps it at expiresIn when that is set.
+func ttlFor(base, expiresIn time.Duration) time.Duration {
+	ttl := base - base/10 + mrand.N(base/5)
+	if expiresIn > 0 && expiresIn < ttl {
+		return expiresIn
+	}
+	return ttl
 }
 
 func newCode() string {
@@ -100,7 +146,7 @@ func newCode() string {
 }
 
 // validCode reports whether code could have been made by newCode. Anything
-// else is rejected before it reaches Postgres.
+// else is rejected before it reaches Redis or Postgres.
 func validCode(code string) bool {
 	return len(code) == codeLen && strings.Trim(code, alphabet) == ""
 }

@@ -1,4 +1,5 @@
-// Command redshortener is a URL shortener that keeps links in Postgres.
+// Command redshortener is a URL shortener that keeps links in Postgres and
+// caches them in Redis.
 package main
 
 import (
@@ -11,11 +12,13 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 //go:embed migrations/*.sql
@@ -47,7 +50,12 @@ func run() error {
 		return fmt.Errorf("migrating: %w", err)
 	}
 
-	links := &Links{db: db}
+	rdb := redis.NewUniversalClient(&redis.UniversalOptions{
+		Addrs: strings.Split(env("REDIS_ADDR", "localhost:6379"), ","),
+	})
+	defer rdb.Close()
+
+	links := &Links{db: db, rdb: rdb}
 	srv := &http.Server{
 		Addr:              env("ADDR", ":8080"),
 		Handler:           newHandler(links, base),
