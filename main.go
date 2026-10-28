@@ -50,15 +50,13 @@ func run() error {
 		return fmt.Errorf("migrating: %w", err)
 	}
 
-	// Short timeouts: when Redis hangs, a lookup should give up and go to
-	// Postgres, not wait out the defaults of several seconds.
-	rdb := redis.NewUniversalClient(&redis.UniversalOptions{
-		Addrs:        strings.Split(env("REDIS_ADDR", "localhost:6379"), ","),
-		DialTimeout:  time.Second,
-		ReadTimeout:  200 * time.Millisecond,
-		WriteTimeout: 200 * time.Millisecond,
-		MaxRetries:   1,
-	})
+	opts := &redis.UniversalOptions{
+		Addrs:                 strings.Split(env("REDIS_ADDR", "localhost:6379"), ","),
+		MaxRetries:            1,
+		ContextTimeoutEnabled: true,
+	}
+	rdb := redis.NewUniversalClient(opts)
+	rdb.AddHook(redisBudget(300 * time.Millisecond))
 	defer rdb.Close()
 
 	links := &Links{db: db, rdb: rdb}
@@ -139,4 +137,29 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// redisBudget gives every Redis command and pipeline a deadline that covers
+// dialing and retries too. Per-step timeouts do not add up to a bound: with
+// a dead primary, go-redis dials 5 times per attempt, and each dial gets the
+// full dial timeout. When the budget runs out, the caller goes on without
+// Redis.
+type redisBudget time.Duration
+
+func (b redisBudget) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (b redisBudget) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		ctx, cancel := context.WithTimeout(ctx, time.Duration(b))
+		defer cancel()
+		return next(ctx, cmd)
+	}
+}
+
+func (b redisBudget) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		ctx, cancel := context.WithTimeout(ctx, time.Duration(b))
+		defer cancel()
+		return next(ctx, cmds)
+	}
 }
