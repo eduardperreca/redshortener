@@ -1,0 +1,45 @@
+# docker compose -f compose.yaml -f compose.cluster.yaml up -d --build
+#
+# A Redis Cluster of three primaries with one replica each. The app reads
+# links from the replicas. Use it instead of compose.sentinel.yaml, not
+# together with it.
+
+x-node: &node
+  image: redis:8
+  command: redis-server --cluster-enabled yes --cluster-node-timeout 5000 --maxmemory 100mb --maxmemory-policy volatile-lfu --save "" --appendonly no
+  healthcheck:
+    test: redis-cli ping
+    interval: 1s
+
+services:
+  app:
+    environment:
+      REDIS_ADDR: node1:6379,node2:6379,node3:6379,node4:6379,node5:6379,node6:6379
+    depends_on:
+      cluster-init: { condition: service_completed_successfully }
+
+  node1: *node
+  node2: *node
+  node3: *node
+  node4: *node
+  node5: *node
+  node6: *node
+
+  # redis-cli --cluster create wants IP addresses, not host names.
+  cluster-init:
+    image: redis:8
+    depends_on:
+      node1: { condition: service_healthy }
+      node2: { condition: service_healthy }
+      node3: { condition: service_healthy }
+      node4: { condition: service_healthy }
+      node5: { condition: service_healthy }
+      node6: { condition: service_healthy }
+    command:
+      - sh
+      - -c
+      - |
+        redis-cli -h node1 cluster info | grep -q cluster_state:ok && exit 0
+        redis-cli --cluster create --cluster-replicas 1 --cluster-yes \
+          $$(for n in 1 2 3 4 5 6; do echo $$(getent hosts node$$n | cut -d' ' -f1):6379; done)
+        until redis-cli -h node1 cluster info | grep -q cluster_state:ok; do sleep 1; done

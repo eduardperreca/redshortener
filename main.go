@@ -73,6 +73,10 @@ func run() error {
 		fo.ReplicaOnly = true
 		rdb = redis.NewFailoverClusterClient(fo)
 	} else {
+		// With several addresses this is a Redis Cluster client, and ReadOnly
+		// sends read-only commands to the replicas of each slot. A single
+		// address gives a plain client, which ignores it.
+		opts.ReadOnly = true
 		rdb = redis.NewUniversalClient(opts)
 	}
 	rdb.AddHook(redisBudget(300 * time.Millisecond))
