@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"os"
 	"testing"
@@ -30,24 +31,36 @@ func newLinks(t *testing.T) *Links {
 	return &Links{db: db, rdb: rdb}
 }
 
-// A miss reads Postgres and fills the cache, with a TTL capped at the
-// link's expiry.
+// Walks one code through every state the cache can be in.
 func TestCacheAside(t *testing.T) {
 	l := newLinks(t)
 	ctx := context.Background()
 
+	// Unknown codes are cached as "not found".
+	code := newCode()
+	if _, err := l.Resolve(ctx, code); !errors.Is(err, errNotFound) {
+		t.Fatalf("unknown code: got %v, want errNotFound", err)
+	}
+	if v, err := l.rdb.Get(ctx, cacheKey(code)).Result(); err != nil || v != "" {
+		t.Fatalf("negative entry: got %q, %v", v, err)
+	}
+
+	// A new link is cached on creation, with a TTL capped at its expiry.
 	link, err := l.Create(ctx, "https://example.com/", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if ttl := l.rdb.PTTL(ctx, cacheKey(link.Code)).Val(); ttl <= 0 || ttl > time.Hour {
+		t.Fatalf("cache TTL %v, want at most 1h", ttl)
+	}
+
+	// A miss reads Postgres and fills the cache again.
+	l.rdb.Del(ctx, cacheKey(link.Code))
 	if got, err := l.Resolve(ctx, link.Code); err != nil || got != link.URL {
 		t.Fatalf("after miss: got %q, %v", got, err)
 	}
 	if got := l.rdb.Get(ctx, cacheKey(link.Code)).Val(); got != link.URL {
 		t.Fatalf("cache after miss: got %q", got)
-	}
-	if ttl := l.rdb.PTTL(ctx, cacheKey(link.Code)).Val(); ttl <= 0 || ttl > time.Hour {
-		t.Fatalf("cache TTL %v, want at most 1h", ttl)
 	}
 }
 

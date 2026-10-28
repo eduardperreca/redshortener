@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-	codeLen  = 7
-	cacheTTL = 24 * time.Hour
+	alphabet    = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	codeLen     = 7
+	cacheTTL    = 24 * time.Hour
+	negativeTTL = time.Minute
 )
 
 var errNotFound = errors.New("link not found")
@@ -60,6 +61,14 @@ func (l *Links) Create(ctx context.Context, url string, expiresIn time.Duration)
 		if err != nil {
 			return Link{}, err
 		}
+
+		// Writing the link here, not just deleting the key, replaces any "not
+		// found" entry left by an earlier lookup of this code. Lookups write
+		// "not found" with NX, so a late one cannot overwrite this either.
+		ttl := ttlFor(cacheTTL, expiresIn)
+		if err := l.rdb.Set(ctx, cacheKey(link.Code), url, ttl).Err(); err != nil {
+			slog.WarnContext(ctx, "caching new link", "code", link.Code, "err", err)
+		}
 		return link, nil
 	}
 	return Link{}, errors.New("no free code after 3 attempts")
@@ -70,6 +79,8 @@ func (l *Links) Create(ctx context.Context, url string, expiresIn time.Duration)
 func (l *Links) Resolve(ctx context.Context, code string) (string, error) {
 	url, err := l.rdb.Get(ctx, cacheKey(code)).Result()
 	switch {
+	case err == nil && url == "":
+		return "", errNotFound
 	case err == nil:
 		return url, nil
 	case errors.Is(err, redis.Nil):
@@ -80,7 +91,7 @@ func (l *Links) Resolve(ctx context.Context, code string) (string, error) {
 	return l.load(ctx, code)
 }
 
-// load reads code from Postgres and caches the answer.
+// load reads code from Postgres and caches the answer, including "not found".
 func (l *Links) load(ctx context.Context, code string) (string, error) {
 	var url string
 	var left *float64 // seconds until expiry, read from the Postgres clock
@@ -88,6 +99,9 @@ func (l *Links) load(ctx context.Context, code string) (string, error) {
 		SELECT url, extract(epoch FROM expires_at - now())::float8 FROM links
 		WHERE code = $1 AND (expires_at IS NULL OR expires_at > now())`, code).Scan(&url, &left)
 	if errors.Is(err, pgx.ErrNoRows) {
+		if err := l.rdb.SetNX(ctx, cacheKey(code), "", negativeTTL).Err(); err != nil {
+			slog.WarnContext(ctx, "caching missing link", "code", code, "err", err)
+		}
 		return "", errNotFound
 	}
 	if err != nil {
