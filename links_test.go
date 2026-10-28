@@ -29,7 +29,7 @@ func newLinks(t *testing.T) *Links {
 	}
 	rdb := redis.NewClient(&redis.Options{Addr: addr})
 	t.Cleanup(func() { rdb.Close() })
-	return &Links{db: db, rdb: rdb}
+	return &Links{db: db, ro: db, rdb: rdb}
 }
 
 // Walks one code through every state the cache can be in.
@@ -113,6 +113,35 @@ func TestCheckURL(t *testing.T) {
 	} {
 		if err := checkURL(raw, self); (err == nil) != ok {
 			t.Errorf("checkURL(%.40q) = %v, want ok=%v", raw, err, ok)
+		}
+	}
+}
+
+// A replica is usually a millisecond behind the primary, so a link read
+// right after it is created is often missing there. It must still resolve,
+// and must not be cached as not found.
+func TestReadAfterCreate(t *testing.T) {
+	l := newLinks(t)
+	u := os.Getenv("DATABASE_READ_URL")
+	if u == "" {
+		t.Skip("DATABASE_READ_URL not set")
+	}
+	ctx := context.Background()
+	ro, err := pgxpool.New(ctx, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	l.ro = ro
+
+	for range 100 {
+		link, err := l.Create(ctx, "https://example.com/", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.rdb.Del(ctx, cacheKey(link.Code)) // as if caching the new link had failed
+		if _, err := l.Resolve(ctx, link.Code); err != nil {
+			t.Fatalf("resolving %s right after creating it: %v", link.Code, err)
 		}
 	}
 }

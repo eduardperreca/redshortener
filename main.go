@@ -49,6 +49,13 @@ func run() error {
 	if err := migrate(ctx, db); err != nil {
 		return fmt.Errorf("migrating: %w", err)
 	}
+	ro := db
+	if u := os.Getenv("DATABASE_READ_URL"); u != "" {
+		if ro, err = pgxpool.New(ctx, u); err != nil {
+			return err
+		}
+		defer ro.Close()
+	}
 
 	opts := &redis.UniversalOptions{
 		Addrs:                 strings.Split(env("REDIS_ADDR", "localhost:6379"), ","),
@@ -71,7 +78,7 @@ func run() error {
 	rdb.AddHook(redisBudget(300 * time.Millisecond))
 	defer rdb.Close()
 
-	links := &Links{db: db, rdb: rdb}
+	links := &Links{db: db, ro: ro, rdb: rdb}
 	srv := &http.Server{
 		Addr:              env("ADDR", ":8080"),
 		Handler:           newHandler(links, base, os.Getenv("CLIENT_IP_HEADER")),

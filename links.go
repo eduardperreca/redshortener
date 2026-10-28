@@ -44,11 +44,35 @@ type Link struct {
 // Links stores links in Postgres and caches lookups in Redis.
 type Links struct {
 	db  *pgxpool.Pool
+	ro  *pgxpool.Pool // a read replica, or db itself
 	rdb redis.UniversalClient
 	sf  singleflight.Group
 }
 
 func cacheKey(code string) string { return "link:" + code }
+
+// read runs a single-row query on the replica. If the replica has no row or
+// fails, it runs the query again on the primary: a link created a moment ago
+// may not have reached the replica yet, and a "not found" from a lagging
+// replica would be cached for a minute.
+func (l *Links) read(ctx context.Context, sql string, args ...any) pgx.Row {
+	return replicaRow{l, ctx, sql, args}
+}
+
+type replicaRow struct {
+	l    *Links
+	ctx  context.Context
+	sql  string
+	args []any
+}
+
+func (r replicaRow) Scan(dest ...any) error {
+	err := r.l.ro.QueryRow(r.ctx, r.sql, r.args...).Scan(dest...)
+	if err != nil && r.l.ro != r.l.db {
+		err = r.l.db.QueryRow(r.ctx, r.sql, r.args...).Scan(dest...)
+	}
+	return err
+}
 
 // Create stores url under a new random code. A zero expiresIn means the link
 // never expires.
@@ -121,7 +145,7 @@ func (l *Links) Resolve(ctx context.Context, code string) (string, error) {
 func (l *Links) load(ctx context.Context, code string) (string, error) {
 	var url string
 	var left *float64 // seconds until expiry, read from the Postgres clock
-	err := l.db.QueryRow(ctx, `
+	err := l.read(ctx, `
 		SELECT url, extract(epoch FROM expires_at - now())::float8 FROM links
 		WHERE code = $1 AND (expires_at IS NULL OR expires_at > now())`, code).Scan(&url, &left)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -149,7 +173,7 @@ func (l *Links) load(ctx context.Context, code string) (string, error) {
 // Stats returns the stored link. Clicks lag behind by up to one flush interval.
 func (l *Links) Stats(ctx context.Context, code string) (Link, error) {
 	link := Link{Code: code}
-	err := l.db.QueryRow(ctx, `
+	err := l.read(ctx, `
 		SELECT url, created_at, expires_at, clicks FROM links
 		WHERE code = $1 AND (expires_at IS NULL OR expires_at > now())`, code).
 		Scan(&link.URL, &link.CreatedAt, &link.ExpiresAt, &link.Clicks)
