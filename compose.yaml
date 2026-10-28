@@ -1,0 +1,41 @@
+# docker compose up -d --build    app on http://localhost:8080, with Postgres and Redis
+# docker compose up -d postgres redis    only the stores, to run the app with go run .
+
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://redshortener:redshortener@postgres:5432/redshortener
+      REDIS_ADDR: redis:6379
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: redshortener
+      POSTGRES_PASSWORD: redshortener
+      POSTGRES_DB: redshortener
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: pg_isready -U redshortener
+      interval: 1s
+
+  # Redis is a cache here: bounded memory and no persistence, since everything
+  # in it can be rebuilt from Postgres. volatile-lfu only evicts keys with a
+  # TTL, so the pending click counts (no TTL) are never evicted, and it keeps
+  # frequently used links over recently used ones.
+  redis:
+    image: redis:8
+    command: redis-server --maxmemory 100mb --maxmemory-policy volatile-lfu --save "" --appendonly no
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgdata:
