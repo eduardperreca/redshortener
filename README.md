@@ -28,6 +28,14 @@ Redis:
 docker compose -f compose.yaml -f compose.sentinel.yaml up -d --build
 ```
 
+With a Postgres streaming replica for reads, alone or together with the
+Sentinel setup:
+
+```sh
+docker compose -f compose.yaml -f compose.pgreplica.yaml up -d --build
+docker compose -f compose.yaml -f compose.sentinel.yaml -f compose.pgreplica.yaml up -d --build
+```
+
 ## API
 
 Create a link. `expires_in` is in seconds and optional; without it the link
@@ -69,6 +77,7 @@ without a user name or password, and not pointing to the shortener itself.
 | `DATABASE_URL`     | `postgres://redshortener:redshortener@localhost:5432/redshortener` |
 | `REDIS_ADDR`       | `localhost:6379`; comma-separated Sentinels with `REDIS_MASTER` |
 | `REDIS_MASTER`     | empty; the Sentinel master name to go through Sentinel         |
+| `DATABASE_READ_URL` | empty; a Postgres replica for cache misses and stats          |
 | `CLIENT_IP_HEADER` | empty: rate limit by the TCP peer address                      |
 
 Behind a reverse proxy, every request comes from the proxy, so all clients
@@ -330,6 +339,65 @@ clicks.
 - Migrations in `migrations/` run at startup in one transaction, behind an
   advisory lock, so instances that start together wait for each other.
 
+### Postgres replica
+
+With `DATABASE_READ_URL` set, cache misses and `GET /api/links/{code}` read
+from a streaming replica. Creating links, flushing clicks and deleting expired
+links stay on the primary.
+
+#### How far behind the replica is
+
+Postgres confirms a commit once the WAL is flushed on the primary. The
+replica receives the WAL after that, writes it and replays it, so a read on
+the replica right after a commit usually comes too early. 2,000 rounds of
+`INSERT` on the primary followed by `SELECT` of the same row on the replica:
+
+| Primary load        | Rows missing on the replica | Time until visible |
+| ------------------- | --------------------------- | ------------------ |
+| none                | 1,995 of 2,000              | p50 0.9 ms, p99 2.2 ms, max 6.5 ms |
+| 8 concurrent writers | 1,999 of 2,000             | p50 2.3 ms, p99 5.6 ms, max 31 ms  |
+
+That is the opposite of the Redis result above, where the replica had every
+key by the time the client asked.
+
+#### Read-your-writes
+
+Creating a link writes it to the cache, so it is normally read from Redis,
+not from the replica. When that write did not happen, because Redis was
+unreachable or evicted the key, a redirect right after the create misses the
+cache and asks the replica, which most likely does not have the row yet. On
+its own that is a 404 for a few milliseconds. Combined with negative caching
+it is worse: the "not found" is written to Redis and the link stays hidden for
+a minute.
+
+So a read that finds no row on the replica, or fails there, runs again on the
+primary, and only a "not found" from the primary is cached. Unknown codes cost
+two queries the first time and are then served from the negative cache.
+`TestReadAfterCreate` creates a link, removes it from the cache and resolves it
+right away, 100 times. Without the retry on the primary it fails in the first
+round.
+
+Other ways to get read-your-writes, not used here:
+
+- Remember the primary's WAL position after the insert
+  (`pg_current_wal_lsn()`) and read from the replica only once
+  `pg_last_wal_replay_lsn()` there has reached it. Exact, but the position has
+  to travel with the client, in a cookie for example.
+- `synchronous_commit = remote_apply` with the replica listed in
+  `synchronous_standby_names`: the commit returns only after the replica has
+  applied it. Every insert then waits for the replica, and stops if the replica
+  is down.
+
+#### When the replica is down
+
+Reads go to the primary after the replica fails, and `/readyz` only checks the
+primary. A replica that hangs instead of refusing connections makes each read
+wait for the connection attempt first; set `connect_timeout` in
+`DATABASE_READ_URL` to bound that.
+
+The app does not fail over the primary. That needs a tool such as Patroni and
+is out of scope here.
+
 ### Redirect status
 
 Redirects use `302`. Browsers cache a `301` indefinitely, so later clicks would
@@ -356,13 +424,14 @@ REDIS_ADDR=localhost:6379 go test -race ./...
 ```
 
 Without the two variables, only the tests that need no database run.
+`TestReadAfterCreate` also needs `DATABASE_READ_URL`, pointing to a replica of
+the same database; CI has no replica and skips it.
 
 ## Roadmap
 
 - v0.2: Redis Sentinel, with redirects read from Redis replicas. Done.
 - v0.3: a Postgres streaming replica for reads, and the read-your-writes
-  problem it brings: a link created on the primary and missed on a lagging
-  replica reads as not found.
+  problem it brings. Done.
 - v0.4: several app instances behind Caddy.
 - v0.5: Redis Cluster.
 - v1.0: failover experiments, written up in `docs/`.
@@ -374,6 +443,7 @@ Without the two variables, only the tests that need no database run.
 - Redis, [Key eviction](https://redis.io/docs/latest/develop/reference/eviction/).
 - Redis, [Replication](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/), including the safety of replication when the primary has persistence turned off.
 - Redis, [High availability with Sentinel](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/).
+- PostgreSQL, [Log-Shipping Standby Servers](https://www.postgresql.org/docs/current/warm-standby.html) and [synchronous_commit](https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT).
 - PostgreSQL, [Heap-Only Tuples](https://www.postgresql.org/docs/current/storage-hot.html).
 
 ## License
