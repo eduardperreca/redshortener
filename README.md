@@ -36,6 +36,13 @@ docker compose -f compose.yaml -f compose.pgreplica.yaml up -d --build
 docker compose -f compose.yaml -f compose.sentinel.yaml -f compose.pgreplica.yaml up -d --build
 ```
 
+With three app instances behind Caddy, which then serves port 8080. Add
+`-f compose.scale.yaml` to any of the commands above:
+
+```sh
+docker compose -f compose.yaml -f compose.scale.yaml up -d --build
+```
+
 ## API
 
 Create a link. `expires_in` is in seconds and optional; without it the link
@@ -398,6 +405,50 @@ wait for the connection attempt first; set `connect_timeout` in
 The app does not fail over the primary. That needs a tool such as Patroni and
 is out of scope here.
 
+### Several app instances
+
+The app keeps no state of its own between requests: the cache, the pending
+click counts and the rate limits live in Redis, the links in Postgres. So
+instances can be added behind a load balancer without changes.
+`compose.scale.yaml` runs three behind Caddy, with all the other compose files
+included, and the following was checked there.
+
+**Migrations run once.** The three instances started at the same moment on an
+empty database. One applied the migration; the other two waited on the
+advisory lock and then found it applied.
+
+**The rate limit is shared.** Twelve creates from one client gave ten `201`s
+and two `429`s. The `201`s were served by the instances 2, 4 and 4 times: the
+limit belongs to the client, not to the instance that happens to answer.
+
+Caddy overwrites `X-Real-IP` with the address it sees. A test that sent a
+different `X-Real-IP` with every request was still limited as a single client,
+so the header cannot be used to dodge the limit.
+
+**Stampede protection is per instance.** `singleflight` only merges misses
+inside one process. Removing a hot link from the cache and sending 300
+requests, 100 at a time, gave between 1 and 5 misses over the three instances,
+never more than 2 on one.
+
+**Stopping an instance loses no requests.** Four clients sent a redirect and a
+create in a loop for 30 seconds, 5,842 requests in all. During that time one
+instance was stopped with `SIGTERM`, another killed with `SIGKILL`, and both
+were started again. No request failed. The slowest took 290 ms, at the moment
+of the stop: Caddy could not reach the stopping instance and retried on
+another after its default `lb_try_interval` of 250 ms. An instance that gets
+`SIGTERM` finishes the requests it has, flushes the click counts and exits.
+
+**Clicks are counted once.** Those 2,921 redirects all went to one link, and
+after the next flush it had 2,921 clicks in Postgres. Pending counts are kept
+in Redis, not in the process, so killing an instance loses none of them, except
+for a batch it has taken from Redis and not written yet. Two instances
+flushing at once can update the same rows in different orders and deadlock;
+Postgres then aborts one, whose counts go back to Redis. That did not happen
+here: `pg_stat_database.deadlocks` stayed at 0.
+
+Metrics are per instance. Prometheus has to scrape each instance, not the load
+balancer, which would return a different instance's numbers on each scrape.
+
 ### Redirect status
 
 Redirects use `302`. Browsers cache a `301` indefinitely, so later clicks would
@@ -432,7 +483,7 @@ the same database; CI has no replica and skips it.
 - v0.2: Redis Sentinel, with redirects read from Redis replicas. Done.
 - v0.3: a Postgres streaming replica for reads, and the read-your-writes
   problem it brings. Done.
-- v0.4: several app instances behind Caddy.
+- v0.4: several app instances behind Caddy. Done.
 - v0.5: Redis Cluster.
 - v1.0: failover experiments, written up in `docs/`.
 
