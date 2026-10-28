@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"math/rand/v2"
 	"strconv"
 	"time"
 
@@ -12,7 +14,7 @@ import (
 )
 
 const (
-	clicksKey     = "clicks:pending"
+	clickShards   = 16
 	flushInterval = 10 * time.Second
 	purgeInterval = time.Hour
 )
@@ -22,63 +24,84 @@ var clicksFlushed = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Clicks moved from Redis to Postgres.",
 })
 
-// Hit counts a click on code. Counts collect in a Redis hash and reach
+func clicksKey(shard int) string { return "clicks:pending:" + strconv.Itoa(shard) }
+
+// Hit counts a click on code. Counts collect in Redis hashes and reach
 // Postgres in batches, so a redirect never writes to Postgres.
+//
+// There are 16 hashes, and each click goes to a random one. With a single
+// hash, every click in a Redis Cluster would go to the primary that owns its
+// slot. Picking the hash at random instead of by code also spreads the clicks
+// of one popular link.
 func (l *Links) Hit(ctx context.Context, code string) {
-	// ponytail: one hash holds every pending count, so in Redis Cluster it is
-	// one hot slot. Shard it into clicks:pending:{0..n} when that shows up.
-	if err := l.rdb.HIncrBy(ctx, clicksKey, code, 1).Err(); err != nil {
+	if err := l.rdb.HIncrBy(ctx, clicksKey(rand.N(clickShards)), code, 1).Err(); err != nil {
 		slog.WarnContext(ctx, "counting click", "code", code, "err", err)
 	}
 }
 
 // flushClicks moves the pending counts from Redis to Postgres.
 //
-// HGETALL and DEL run in one MULTI, so when several instances flush at once,
-// each count is taken by exactly one of them. If Postgres rejects the batch,
-// the counts go back into Redis for the next flush. If the process dies
-// between taking the counts and writing them, they are lost: a click is
-// counted at most once.
+// For each hash, HGETALL and DEL run in one MULTI, so when several instances
+// flush at once, each count is taken by exactly one of them. If the MULTI
+// fails for some hashes, the counts taken from the others are still written.
+// If Postgres rejects the batch, the counts go back into Redis for the next
+// flush. If the process dies between taking the counts and writing them, they
+// are lost: a click is counted at most once.
 func (l *Links) flushClicks(ctx context.Context) error {
-	var pending *redis.MapStringStringCmd
-	_, err := l.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
-		pending = p.HGetAll(ctx, clicksKey)
-		p.Del(ctx, clicksKey)
-		return nil
-	})
-	if err != nil || len(pending.Val()) == 0 {
-		return err
+	// One MULTI per hash: in a Redis Cluster, a MULTI can only use keys of
+	// one slot, and go-redis rejects the whole pipeline otherwise.
+	//
+	// The same code can be pending in several hashes. UPDATE ... FROM would
+	// apply only one of its rows, so the counts are summed first.
+	sum := map[string]int64{}
+	var rerr error
+	for i := range clickShards {
+		var pending *redis.MapStringStringCmd
+		_, err := l.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+			pending = p.HGetAll(ctx, clicksKey(i))
+			p.Del(ctx, clicksKey(i))
+			return nil
+		})
+		if err != nil {
+			rerr = errors.Join(rerr, err)
+			continue
+		}
+		for code, s := range pending.Val() {
+			n, _ := strconv.ParseInt(s, 10, 64)
+			sum[code] += n
+		}
 	}
-
-	codes := make([]string, 0, len(pending.Val()))
-	counts := make([]int64, 0, len(pending.Val()))
+	if len(sum) == 0 {
+		return rerr
+	}
+	codes := make([]string, 0, len(sum))
+	counts := make([]int64, 0, len(sum))
 	var total int64
-	for code, s := range pending.Val() {
-		n, _ := strconv.ParseInt(s, 10, 64)
+	for code, n := range sum {
 		codes = append(codes, code)
 		counts = append(counts, n)
 		total += n
 	}
 
 	// Codes that expired or never existed match no row and are dropped.
-	_, err = l.db.Exec(ctx, `
+	_, err := l.db.Exec(ctx, `
 		UPDATE links SET clicks = clicks + c.n
 		FROM unnest($1::text[], $2::bigint[]) AS c(code, n)
 		WHERE links.code = c.code`, codes, counts)
 	if err != nil {
 		_, perr := l.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
 			for i, code := range codes {
-				p.HIncrBy(ctx, clicksKey, code, counts[i])
+				p.HIncrBy(ctx, clicksKey(rand.N(clickShards)), code, counts[i])
 			}
 			return nil
 		})
 		if perr != nil {
 			slog.ErrorContext(ctx, "clicks lost", "count", total, "err", perr)
 		}
-		return err
+		return errors.Join(rerr, err)
 	}
 	clicksFlushed.Add(float64(total))
-	return nil
+	return rerr
 }
 
 // background flushes clicks and deletes expired links until ctx is done,
