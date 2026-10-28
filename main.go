@@ -52,10 +52,22 @@ func run() error {
 
 	opts := &redis.UniversalOptions{
 		Addrs:                 strings.Split(env("REDIS_ADDR", "localhost:6379"), ","),
+		MasterName:            os.Getenv("REDIS_MASTER"),
 		MaxRetries:            1,
 		ContextTimeoutEnabled: true,
 	}
-	rdb := redis.NewUniversalClient(opts)
+	var rdb redis.UniversalClient
+	if opts.MasterName != "" {
+		// Through Sentinel, with read-only commands such as GET sent to a
+		// replica and everything else to the primary. It has to be a
+		// failover cluster client: NewUniversalClient with ReadOnly would
+		// send writes to a replica too.
+		fo := opts.Failover()
+		fo.ReplicaOnly = true
+		rdb = redis.NewFailoverClusterClient(fo)
+	} else {
+		rdb = redis.NewUniversalClient(opts)
+	}
 	rdb.AddHook(redisBudget(300 * time.Millisecond))
 	defer rdb.Close()
 

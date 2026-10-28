@@ -1,0 +1,46 @@
+# docker compose -f compose.yaml -f compose.sentinel.yaml up -d --build
+#
+# A Redis primary with two replicas and three Sentinels. The app asks
+# Sentinel for the primary and reads links from the replicas. The redis
+# service from compose.yaml still starts but is not used.
+
+x-redis: &redis
+  image: redis:8
+  command: redis-server --maxmemory 100mb --maxmemory-policy volatile-lfu --save "" --appendonly no
+
+x-sentinel: &sentinel
+  image: redis:8
+  depends_on: [redis-primary, redis-replica1, redis-replica2]
+  # Sentinel rewrites its config file at runtime, so it needs a writable copy.
+  command:
+    - sh
+    - -c
+    - |
+      cat > /tmp/sentinel.conf <<EOF
+      sentinel resolve-hostnames yes
+      sentinel monitor mymaster redis-primary 6379 2
+      sentinel down-after-milliseconds mymaster 5000
+      sentinel failover-timeout mymaster 10000
+      EOF
+      exec redis-sentinel /tmp/sentinel.conf
+
+services:
+  app:
+    environment:
+      REDIS_ADDR: sentinel1:26379,sentinel2:26379,sentinel3:26379
+      REDIS_MASTER: mymaster
+    depends_on:
+      sentinel1: { condition: service_started }
+      sentinel2: { condition: service_started }
+      sentinel3: { condition: service_started }
+
+  redis-primary: *redis
+  redis-replica1:
+    <<: *redis
+    command: redis-server --replicaof redis-primary 6379 --maxmemory 100mb --maxmemory-policy volatile-lfu --save "" --appendonly no
+  redis-replica2:
+    <<: *redis
+    command: redis-server --replicaof redis-primary 6379 --maxmemory 100mb --maxmemory-policy volatile-lfu --save "" --appendonly no
+  sentinel1: *sentinel
+  sentinel2: *sentinel
+  sentinel3: *sentinel
