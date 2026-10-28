@@ -1,0 +1,40 @@
+# docker compose -f compose.yaml -f compose.scale.yaml up -d --build
+#
+# Three app instances behind Caddy, which takes over port 8080. Can be
+# combined with the other compose files.
+
+configs:
+  caddyfile:
+    content: |
+      :8080 {
+        reverse_proxy {
+          # Every app container, from Docker's DNS, refreshed each second.
+          dynamic a app 8080 {
+            refresh 1s
+          }
+          # The app rate limits by this header, so Caddy must overwrite
+          # whatever the client sent.
+          header_up X-Real-IP {remote_host}
+          # A failed upstream is skipped for 10s, and a request that could
+          # not reach one is retried on another for up to 5s.
+          fail_duration 10s
+          lb_try_duration 5s
+        }
+      }
+
+services:
+  app:
+    ports: !reset []
+    deploy:
+      replicas: 3
+    environment:
+      CLIENT_IP_HEADER: X-Real-IP
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "8080:8080"
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    depends_on: [app]
