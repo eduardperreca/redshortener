@@ -1,0 +1,49 @@
+# docker compose -f compose.yaml -f compose.pgreplica.yaml up -d --build
+#
+# A Postgres streaming replica. The app reads links from it and writes to the
+# primary. Combine with compose.sentinel.yaml by passing all three files.
+
+configs:
+  pg_hba:
+    content: |
+      local all         all     trust
+      host  all         all all scram-sha-256
+      host  replication all all scram-sha-256
+
+services:
+  app:
+    environment:
+      DATABASE_READ_URL: postgres://redshortener:redshortener@postgres-replica:5432/redshortener
+    depends_on:
+      postgres-replica: { condition: service_healthy }
+
+  # The image's pg_hba.conf does not allow replication connections from other
+  # hosts, and it is only written when the data directory is created, so the
+  # primary reads this file instead.
+  postgres:
+    command: postgres -c hba_file=/etc/postgresql/pg_hba.conf
+    configs:
+      - source: pg_hba
+        target: /etc/postgresql/pg_hba.conf
+
+  # On first start, copies the primary with pg_basebackup. -R writes
+  # standby.signal and the connection settings, so Postgres starts as a hot
+  # standby that streams WAL from the primary.
+  postgres-replica:
+    image: postgres:18
+    user: postgres
+    environment:
+      PGPASSWORD: redshortener
+    depends_on:
+      postgres: { condition: service_healthy }
+    command:
+      - sh
+      - -c
+      - |
+        if [ ! -s "$$PGDATA/PG_VERSION" ]; then
+          pg_basebackup -h postgres -U redshortener -D "$$PGDATA" -R -X stream
+        fi
+        exec postgres
+    healthcheck:
+      test: pg_isready -U redshortener
+      interval: 1s
