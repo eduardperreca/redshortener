@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -16,6 +17,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+//go:embed index.html
+var indexHTML []byte
+
 const maxExpiresIn = 10 * 365 * 24 * time.Hour
 
 var requestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
@@ -24,7 +28,7 @@ var requestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Buckets: prometheus.ExponentialBuckets(0.0005, 2, 14), // 0.5ms to 4s
 }, []string{"route", "code"})
 
-// newHandler serves the API. Client addresses for rate
+// newHandler serves the API and the web page. Client addresses for rate
 // limiting come from ipHeader when it is set, and from the TCP connection
 // otherwise.
 func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
@@ -38,6 +42,10 @@ func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
 	})
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(indexHTML)
+	})
 
 	mux.Handle("POST /api/links", limit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
