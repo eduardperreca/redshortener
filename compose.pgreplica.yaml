@@ -45,5 +45,6 @@ services:
         fi
         exec postgres
     healthcheck:
-      test: pg_isready -U redshortener
+      test: pg_isready -h localhost -U redshortener
       interval: 1s
+      start_period: 60s

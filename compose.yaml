@@ -23,9 +23,12 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql
+    # -h localhost: while the image initializes a new data directory, it runs a
+    # temporary server on the Unix socket only, which must not count as ready.
     healthcheck:
-      test: pg_isready -U redshortener
+      test: pg_isready -h localhost -U redshortener
       interval: 1s
+      start_period: 60s
 
   # Redis is a cache here: bounded memory and no persistence, since everything
   # in it can be rebuilt from Postgres. volatile-lfu only evicts keys with a
