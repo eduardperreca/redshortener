@@ -7,12 +7,22 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/eduardperreca/redlimit"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const maxExpiresIn = 10 * 365 * 24 * time.Hour
+
+var requestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "redshortener_http_request_duration_seconds",
+	Help:    "HTTP request latency by route and status code.",
+	Buckets: prometheus.ExponentialBuckets(0.0005, 2, 14), // 0.5ms to 4s
+}, []string{"route", "code"})
 
 // newHandler serves the API. Client addresses for rate
 // limiting come from ipHeader when it is set, and from the TCP connection
@@ -110,8 +120,31 @@ func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
 			http.Error(w, "postgres: "+err.Error(), http.StatusServiceUnavailable)
 		}
 	})
+	mux.Handle("GET /metrics", promhttp.Handler())
 
-	return mux
+	return instrument(mux)
+}
+
+// instrument records request latency. It reads r.Pattern after the mux has
+// routed the request, so the route label is the pattern, not the raw path,
+// and does not grow with every code.
+func instrument(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		requestDuration.WithLabelValues(r.Pattern, strconv.Itoa(rec.status)).Observe(time.Since(start).Seconds())
+	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

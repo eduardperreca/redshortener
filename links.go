@@ -12,6 +12,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 )
@@ -25,6 +27,11 @@ const (
 )
 
 var errNotFound = errors.New("link not found")
+
+var cacheLookups = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "redshortener_cache_lookups_total",
+	Help: "Redirect lookups in Redis by result: hit, negative_hit, miss or error.",
+}, []string{"result"})
 
 type Link struct {
 	Code      string     `json:"code"`
@@ -83,12 +90,15 @@ func (l *Links) Resolve(ctx context.Context, code string) (string, error) {
 	url, err := l.rdb.Get(ctx, cacheKey(code)).Result()
 	switch {
 	case err == nil && url == "":
+		cacheLookups.WithLabelValues("negative_hit").Inc()
 		return "", errNotFound
 	case err == nil:
+		cacheLookups.WithLabelValues("hit").Inc()
 		return url, nil
 	case errors.Is(err, redis.Nil):
-		// not cached
+		cacheLookups.WithLabelValues("miss").Inc()
 	default:
+		cacheLookups.WithLabelValues("error").Inc()
 		slog.WarnContext(ctx, "reading cache", "code", code, "err", err)
 	}
 

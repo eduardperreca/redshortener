@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -14,6 +16,11 @@ const (
 	flushInterval = 10 * time.Second
 	purgeInterval = time.Hour
 )
+
+var clicksFlushed = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "redshortener_clicks_flushed_total",
+	Help: "Clicks moved from Redis to Postgres.",
+})
 
 // Hit counts a click on code. Counts collect in a Redis hash and reach
 // Postgres in batches, so a redirect never writes to Postgres.
@@ -70,6 +77,7 @@ func (l *Links) flushClicks(ctx context.Context) error {
 		}
 		return err
 	}
+	clicksFlushed.Add(float64(total))
 	return nil
 }
 
