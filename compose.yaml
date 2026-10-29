@@ -19,8 +19,10 @@ services:
       POSTGRES_USER: redshortener
       POSTGRES_PASSWORD: redshortener
       POSTGRES_DB: redshortener
+    # Published on localhost only: Redis has no password, and Postgres uses
+    # the one in this file.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql
     # -h localhost: while the image initializes a new data directory, it runs a
@@ -38,7 +40,7 @@ services:
     image: redis:8
     command: redis-server --maxmemory 100mb --maxmemory-policy volatile-lfu --save "" --appendonly no
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
 
 volumes:
   pgdata:
