@@ -54,25 +54,14 @@ type Links struct {
 
 func cacheKey(code string) string { return "link:" + code }
 
-// read runs a single-row query on the replica. If the replica has no row or
-// fails, it runs the query again on the primary: a link created a moment ago
-// may not have reached the replica yet, and a "not found" from a lagging
-// replica would be cached for a minute.
-func (l *Links) read(ctx context.Context, sql string, args ...any) pgx.Row {
-	return replicaRow{l, ctx, sql, args}
-}
-
-type replicaRow struct {
-	l    *Links
-	ctx  context.Context
-	sql  string
-	args []any
-}
-
-func (r replicaRow) Scan(dest ...any) error {
-	err := r.l.ro.QueryRow(r.ctx, r.sql, r.args...).Scan(dest...)
-	if err != nil && r.l.ro != r.l.db {
-		err = r.l.db.QueryRow(r.ctx, r.sql, r.args...).Scan(dest...)
+// readCode scans the row a query by code returns, from the replica. If the
+// replica has no row or fails, it runs the query again on the primary: a link
+// created a moment ago may not have reached the replica yet, and a "not found"
+// from a lagging replica would be cached for a minute.
+func (l *Links) readCode(ctx context.Context, sql, code string, dest ...any) error {
+	err := l.ro.QueryRow(ctx, sql, code).Scan(dest...)
+	if err != nil && l.ro != l.db {
+		err = l.db.QueryRow(ctx, sql, code).Scan(dest...)
 	}
 	return err
 }
@@ -80,11 +69,6 @@ func (r replicaRow) Scan(dest ...any) error {
 // Create stores url under alias, or under a new random code when alias is
 // empty. A zero expiresIn means the link never expires.
 func (l *Links) Create(ctx context.Context, url string, expiresIn time.Duration, alias string) (Link, error) {
-	var secs *float64
-	if expiresIn > 0 {
-		s := expiresIn.Seconds()
-		secs = &s
-	}
 	for range 3 {
 		link := Link{Code: alias, URL: url}
 		if alias == "" {
@@ -95,11 +79,11 @@ func (l *Links) Create(ctx context.Context, url string, expiresIn time.Duration,
 		// not been deleted yet is taken over.
 		err := l.db.QueryRow(ctx, `
 			INSERT INTO links (code, url, expires_at)
-			VALUES ($1, $2, now() + make_interval(secs => $3))
+			VALUES ($1, $2, now() + nullif($3::float8, 0) * interval '1 second')
 			ON CONFLICT (code) DO UPDATE
 				SET url = excluded.url, created_at = now(), expires_at = excluded.expires_at, clicks = 0
 				WHERE links.expires_at <= now()
-			RETURNING created_at, expires_at`, link.Code, url, secs).Scan(&link.CreatedAt, &link.ExpiresAt)
+			RETURNING created_at, expires_at`, link.Code, url, expiresIn.Seconds()).Scan(&link.CreatedAt, &link.ExpiresAt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			if alias != "" {
 				return Link{}, errTaken
@@ -159,9 +143,9 @@ func (l *Links) Resolve(ctx context.Context, code string) (string, error) {
 func (l *Links) load(ctx context.Context, code string) (string, error) {
 	var url string
 	var left *float64 // seconds until expiry, read from the Postgres clock
-	err := l.read(ctx, `
+	err := l.readCode(ctx, `
 		SELECT url, extract(epoch FROM expires_at - now())::float8 FROM links
-		WHERE code = $1 AND (expires_at IS NULL OR expires_at > now())`, code).Scan(&url, &left)
+		WHERE code = $1 AND (expires_at IS NULL OR expires_at > now())`, code, &url, &left)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := l.rdb.SetNX(ctx, cacheKey(code), "", negativeTTL).Err(); err != nil {
 			slog.WarnContext(ctx, "caching missing link", "code", code, "err", err)
@@ -187,10 +171,10 @@ func (l *Links) load(ctx context.Context, code string) (string, error) {
 // Stats returns the stored link. Clicks lag behind by up to one flush interval.
 func (l *Links) Stats(ctx context.Context, code string) (Link, error) {
 	link := Link{Code: code}
-	err := l.read(ctx, `
+	err := l.readCode(ctx, `
 		SELECT url, created_at, expires_at, clicks FROM links
-		WHERE code = $1 AND (expires_at IS NULL OR expires_at > now())`, code).
-		Scan(&link.URL, &link.CreatedAt, &link.ExpiresAt, &link.Clicks)
+		WHERE code = $1 AND (expires_at IS NULL OR expires_at > now())`, code,
+		&link.URL, &link.CreatedAt, &link.ExpiresAt, &link.Clicks)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Link{}, errNotFound
 	}
