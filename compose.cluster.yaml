@@ -6,7 +6,11 @@
 
 x-node: &node
   image: redis:8
-  command: redis-server --cluster-enabled yes --cluster-node-timeout 5000 --maxmemory 100mb --maxmemory-policy volatile-lfu --save "" --appendonly no
+  # cluster-require-full-coverage no: when one shard has no primary, the
+  # others keep serving their slots. With the default, every node refuses
+  # every command until a replica takes over. For a cache, two thirds of the
+  # keys are better than none.
+  command: redis-server --cluster-enabled yes --cluster-node-timeout 5000 --cluster-require-full-coverage no --maxmemory 100mb --maxmemory-policy volatile-lfu --save "" --appendonly no
   healthcheck:
     test: redis-cli ping
     interval: 1s
