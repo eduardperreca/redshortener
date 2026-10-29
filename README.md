@@ -36,6 +36,13 @@ docker compose -f compose.yaml -f compose.pgreplica.yaml up -d --build
 docker compose -f compose.yaml -f compose.sentinel.yaml -f compose.pgreplica.yaml up -d --build
 ```
 
+With three Postgres nodes under Patroni, which fails over the primary, instead
+of the streaming replica:
+
+```sh
+docker compose -f compose.yaml -f compose.patroni.yaml up -d --build
+```
+
 With three app instances behind Caddy, which then serves port 8080. Add
 `-f compose.scale.yaml` to any of the commands above:
 
@@ -457,8 +464,69 @@ the replica. A replica that hangs instead of refusing connections makes each rea
 wait for the connection attempt first; set `connect_timeout` in
 `DATABASE_READ_URL` to bound that.
 
-The app does not fail over the primary. That needs a tool such as Patroni and
-is out of scope here.
+The app does not fail over the primary itself; see
+[Postgres failover](#postgres-failover).
+
+### Postgres failover
+
+`compose.patroni.yaml` runs three Postgres nodes under Patroni, with the leader
+key in etcd. The primary renews the key every 2 seconds. When it stops, a
+replica takes the key and is promoted, and the old primary comes back as a
+replica of the new one, after `pg_rewind` if their histories diverged.
+
+The app has no code for this. Both URLs name all three nodes, and the driver
+connects to the first one that has the role asked for in
+`target_session_attrs`:
+
+```
+DATABASE_URL=postgres://...@postgres,postgres2,postgres3/redshortener?target_session_attrs=read-write
+DATABASE_READ_URL=postgres://...@postgres,postgres2,postgres3/redshortener?target_session_attrs=prefer-standby
+```
+
+A pooled connection to a primary that went away fails once and is dropped,
+and the next one finds the new primary.
+
+Killing the primary with `SIGKILL`, while four clients sent redirects and one
+created a link every second (`experiments/failover.sh postgres`):
+
+- All 8,600 redirects succeeded, the slowest in 120 ms. Redirects of cached
+  links never reach Postgres.
+- Creates failed for 19 seconds. Nothing tells etcd that a killed primary is
+  gone, so its key has to expire first, after `ttl` seconds: 20 here, the
+  lowest Patroni accepts. Stopping the primary with `SIGTERM` instead, Patroni
+  gives up the key on the way down, and 2 creates failed.
+- All 14 links created before and after were there afterwards.
+- Click flushes that failed put their counts back in Redis. Over this run, an
+  earlier one and the `SIGTERM` test, Postgres counted 17,645 clicks for
+  17,645 redirects.
+- The killed primary came back as a replica after `pg_rewind`, which threw
+  away the WAL it had written after the new primary's history split off.
+
+Two settings make this safe:
+
+- `synchronous_mode: true`. A commit waits until one replica has flushed it,
+  and Patroni only promotes that replica. Without it, a link created just
+  before a crash can exist only on the dead primary: the app answered `201`
+  and cached the link, so it redirects for up to a day and is then gone. The
+  WAL that `pg_rewind` discards can hold commits too, but only ones the app
+  never got an answer for. The cost is one round trip to the replica on every commit. When no
+  replica is left, Patroni turns synchronous replication off rather than stop
+  writes; `synchronous_mode_strict` would stop them.
+- `failsafe_mode: true`. A primary that cannot reach etcd cannot tell whether
+  another node took over, so by default it steps down. With failsafe mode off
+  and etcd stopped, every create failed from 6 seconds after the stop until
+  etcd came back. With it on, the primary asks the other nodes over Patroni's
+  REST API instead, and keeps running while all of them answer: 40 creates
+  out of 40 succeeded during 40 seconds without etcd.
+
+`/readyz` used to check only the Postgres primary. During the failover it
+answered `503` on all three instances for 19 seconds, while every redirect
+succeeded; a load balancer that followed it would have turned those into
+errors too. It now passes while either Postgres or Redis answers.
+
+This setup runs a single etcd node, which is not replicated itself; a
+deployment would run three. All nodes share one Docker host, so nothing here
+tests a network partition.
 
 ### Several app instances
 
@@ -613,6 +681,8 @@ in [`experiments/`](experiments/README.md).
 - v0.5: Redis Cluster. Done.
 - v1.0: the experiments behind these numbers, in `experiments/`, so that they
   can be run again. Done.
+- v1.1: `WAIT` after the click flush, and Postgres failover with Patroni.
+  Done.
 
 ## References
 
@@ -623,6 +693,9 @@ in [`experiments/`](experiments/README.md).
 - Redis, [High availability with Sentinel](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/).
 - Redis, [Cluster specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/) and [scaling with Redis Cluster](https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/).
 - PostgreSQL, [Log-Shipping Standby Servers](https://www.postgresql.org/docs/current/warm-standby.html) and [synchronous_commit](https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT).
+- PostgreSQL, [libpq connection parameters](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-TARGET-SESSION-ATTRS), for `target_session_attrs` and multiple hosts.
+- Patroni, [replication modes](https://patroni.readthedocs.io/en/latest/replication_modes.html) and [DCS failsafe mode](https://patroni.readthedocs.io/en/latest/dcs_failsafe_mode.html).
+- Redis, [WAIT](https://redis.io/docs/latest/commands/wait/).
 - PostgreSQL, [Heap-Only Tuples](https://www.postgresql.org/docs/current/storage-hot.html).
 
 ## License

@@ -48,18 +48,23 @@ the app logged.
 ```sh
 experiments/failover.sh sentinel   # needs compose.sentinel.yaml
 experiments/failover.sh cluster    # needs compose.cluster.yaml
+experiments/failover.sh postgres   # needs compose.patroni.yaml
 experiments/failover.sh app        # needs compose.scale.yaml
 ```
 
 `sentinel` and `cluster` stop the current Redis primary and print the command
-to start it again; it comes back as a replica. `app` stops one app instance
+to start it again; it comes back as a replica. `postgres` kills the Postgres
+primary with `SIGKILL`, also creates a link every second, and checks
+afterwards that every link it created is still there. `app` stops one app instance
 with `SIGTERM`, kills another with `SIGKILL` 5 seconds later, and starts both
 5 seconds after that.
 
-Expect no failed redirects in any of them. During a Redis failover, click
+Expect no failed redirects in any of them. With `postgres`, creates fail for
+about 20 seconds and no created link is missing. During a Redis failover, click
 writes to the missing primary fail and are logged as `counting click` until a
 replica takes over. See [Failover](../README.md#failover),
-[Redis Cluster](../README.md#redis-cluster) and
+[Redis Cluster](../README.md#redis-cluster),
+[Postgres failover](../README.md#postgres-failover) and
 [Several app instances](../README.md#several-app-instances).
 
 ## Eviction
