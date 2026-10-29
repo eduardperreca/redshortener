@@ -87,6 +87,49 @@ func TestAlias(t *testing.T) {
 	}
 }
 
+// Only the token holder can change a link, every change reaches the cache,
+// and a new link under a freed alias gets a new token.
+func TestChange(t *testing.T) {
+	l := newLinks(t)
+	ctx := context.Background()
+
+	alias := "chg-" + newCode()
+	link, err := l.Create(ctx, "https://example.com/a", 0, alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Update(ctx, alias, "wrong", "https://example.com/x"); !errors.Is(err, errNotFound) {
+		t.Fatalf("wrong token: got %v, want errNotFound", err)
+	}
+	if err := l.Update(ctx, alias, link.Token, "https://example.com/b"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := l.Resolve(ctx, alias); got != "https://example.com/b" {
+		t.Fatalf("after update: got %q", got)
+	}
+
+	// A lookup that read the old URL before the update must not cache it.
+	if l.rdb.SetNX(ctx, cacheKey(alias), "https://example.com/a", time.Hour).Val() {
+		t.Fatal("a late lookup overwrote the updated entry")
+	}
+
+	if err := l.Delete(ctx, alias, link.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Delete(ctx, alias, link.Token); err != nil {
+		t.Fatalf("deleting twice: %v", err)
+	}
+	if _, err := l.Resolve(ctx, alias); !errors.Is(err, errNotFound) {
+		t.Fatalf("after delete: got %v, want errNotFound", err)
+	}
+	if _, err := l.Create(ctx, "https://example.com/c", 0, alias); err != nil {
+		t.Fatalf("reusing the alias: %v", err)
+	}
+	if err := l.Update(ctx, alias, link.Token, "https://example.com/x"); !errors.Is(err, errNotFound) {
+		t.Fatalf("old token on the new link: got %v, want errNotFound", err)
+	}
+}
+
 // Ten instances flushing at once must count every click exactly once.
 func TestConcurrentFlush(t *testing.T) {
 	l := newLinks(t)

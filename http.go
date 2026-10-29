@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/eduardperreca/redlimit"
@@ -116,6 +117,46 @@ func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, link)
+	})))
+
+	// Changing a link needs the token Create returned, as a bearer token.
+	// A wrong token and an unknown code get the same 404.
+	change := func(w http.ResponseWriter, r *http.Request, url string) {
+		code := r.PathValue("code")
+		token, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		var err error
+		if url == "" {
+			err = links.Delete(r.Context(), code, token)
+		} else {
+			err = links.Update(r.Context(), code, token, url)
+		}
+		switch {
+		case errors.Is(err, errNotFound):
+			writeError(w, http.StatusNotFound, "link not found, or wrong token")
+		case err != nil:
+			slog.ErrorContext(r.Context(), "changing link", "code", code, "err", err)
+			writeError(w, http.StatusServiceUnavailable, "could not change link, try again")
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}
+	mux.Handle("PATCH /api/links/{code}", limit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			URL string `json:"url"`
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "body must be JSON with a url field")
+			return
+		}
+		if err := checkURL(req.URL, base); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		change(w, r, req.URL)
+	})))
+	mux.Handle("DELETE /api/links/{code}", limit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		change(w, r, "")
 	})))
 
 	mux.HandleFunc("GET /{code}", func(w http.ResponseWriter, r *http.Request) {

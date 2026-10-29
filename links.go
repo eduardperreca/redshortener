@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"log/slog"
 	mrand "math/rand/v2"
@@ -42,6 +43,7 @@ type Link struct {
 	CreatedAt time.Time  `json:"created_at"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	Clicks    int64      `json:"clicks"`
+	Token     string     `json:"token,omitempty"` // only when created
 }
 
 // Links stores links in Postgres and caches lookups in Redis.
@@ -67,10 +69,12 @@ func (l *Links) readCode(ctx context.Context, sql, code string, dest ...any) err
 }
 
 // Create stores url under alias, or under a new random code when alias is
-// empty. A zero expiresIn means the link never expires.
+// empty. A zero expiresIn means the link never expires. The returned link
+// carries the token that can change or delete it; only its hash is stored.
 func (l *Links) Create(ctx context.Context, url string, expiresIn time.Duration, alias string) (Link, error) {
 	for range 3 {
-		link := Link{Code: alias, URL: url}
+		link := Link{Code: alias, URL: url, Token: rand.Text()}
+		hash := sha256.Sum256([]byte(link.Token))
 		if alias == "" {
 			link.Code = newCode()
 		}
@@ -78,12 +82,13 @@ func (l *Links) Create(ctx context.Context, url string, expiresIn time.Duration,
 		// same alias cannot both succeed. A code whose link has expired but
 		// not been deleted yet is taken over.
 		err := l.db.QueryRow(ctx, `
-			INSERT INTO links (code, url, expires_at)
-			VALUES ($1, $2, now() + nullif($3::float8, 0) * interval '1 second')
+			INSERT INTO links (code, url, expires_at, token_hash)
+			VALUES ($1, $2, now() + nullif($3::float8, 0) * interval '1 second', $4)
 			ON CONFLICT (code) DO UPDATE
-				SET url = excluded.url, created_at = now(), expires_at = excluded.expires_at, clicks = 0
+				SET url = excluded.url, created_at = now(), expires_at = excluded.expires_at,
+					clicks = 0, token_hash = excluded.token_hash
 				WHERE links.expires_at <= now()
-			RETURNING created_at, expires_at`, link.Code, url, expiresIn.Seconds()).Scan(&link.CreatedAt, &link.ExpiresAt)
+			RETURNING created_at, expires_at`, link.Code, url, expiresIn.Seconds(), hash[:]).Scan(&link.CreatedAt, &link.ExpiresAt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			if alias != "" {
 				return Link{}, errTaken
@@ -94,9 +99,9 @@ func (l *Links) Create(ctx context.Context, url string, expiresIn time.Duration,
 			return Link{}, err
 		}
 
-		// Writing the link here, not just deleting the key, replaces any "not
-		// found" entry left by an earlier lookup of this code. Lookups write
-		// "not found" with NX, so a late one cannot overwrite this either.
+		// Writers set the cache entry unconditionally and lookups only with
+		// NX, so a lookup that read Postgres before this insert cannot
+		// overwrite the entry, and this replaces any "not found" left by one.
 		ttl := ttlFor(cacheTTL, expiresIn)
 		if err := l.rdb.Set(ctx, cacheKey(link.Code), url, ttl).Err(); err != nil {
 			slog.WarnContext(ctx, "caching new link", "code", link.Code, "err", err)
@@ -104,6 +109,56 @@ func (l *Links) Create(ctx context.Context, url string, expiresIn time.Duration,
 		return link, nil
 	}
 	return Link{}, errors.New("no free code after 3 attempts")
+}
+
+// Update points code at url, if token is the link's token.
+func (l *Links) Update(ctx context.Context, code, token, url string) error {
+	return l.change(ctx, code, token, url)
+}
+
+// Delete makes code expire now, if token is the link's token. The row stays
+// until the hourly purge, so deleting again succeeds, and an alias is free
+// for a new link at once.
+func (l *Links) Delete(ctx context.Context, code, token string) error {
+	return l.change(ctx, code, token, "")
+}
+
+// change updates the row and writes the new cache entry, url or "not found"
+// for an empty url, before committing. The UPDATE holds the row lock until
+// then, so concurrent changes of one link reach Redis in the order Postgres
+// applies them. If Redis fails, the change is rolled back and the caller can
+// retry: otherwise the old URL could stay cached for a day.
+func (l *Links) change(ctx context.Context, code, token, url string) error {
+	hash := sha256.Sum256([]byte(token))
+	err := pgx.BeginFunc(ctx, l.db, func(tx pgx.Tx) error {
+		var left *float64
+		sql := `UPDATE links SET url = $3 WHERE code = $1 AND token_hash = $2
+			AND (expires_at IS NULL OR expires_at > now())
+			RETURNING extract(epoch FROM expires_at - now())::float8`
+		args := []any{code, hash[:], url}
+		if url == "" {
+			sql = `UPDATE links SET expires_at = now() WHERE code = $1 AND token_hash = $2
+				RETURNING NULL::float8`
+			args = args[:2]
+		}
+		err := tx.QueryRow(ctx, sql, args...).Scan(&left)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound
+		}
+		if err != nil {
+			return err
+		}
+		ttl := negativeTTL
+		if url != "" {
+			ttl = ttlFor(cacheTTL, remaining(left))
+		}
+		return l.rdb.Set(ctx, cacheKey(code), url, ttl).Err()
+	})
+	if err != nil && !errors.Is(err, errNotFound) {
+		// The commit can fail after the cache was written.
+		l.rdb.Del(context.WithoutCancel(ctx), cacheKey(code))
+	}
+	return err
 }
 
 // Resolve returns the URL behind code, from Redis when cached and from
@@ -156,12 +211,10 @@ func (l *Links) load(ctx context.Context, code string) (string, error) {
 		return "", err
 	}
 
-	var expiresIn time.Duration
-	if left != nil {
-		expiresIn = time.Duration(*left * float64(time.Second))
-	}
-	if ttl := ttlFor(cacheTTL, expiresIn); ttl >= time.Millisecond {
-		if err := l.rdb.Set(ctx, cacheKey(code), url, ttl).Err(); err != nil {
+	// NX: if a writer has set the entry since this lookup read Postgres, the
+	// writer's value is newer than url.
+	if ttl := ttlFor(cacheTTL, remaining(left)); ttl >= time.Millisecond {
+		if err := l.rdb.SetNX(ctx, cacheKey(code), url, ttl).Err(); err != nil {
 			slog.WarnContext(ctx, "caching link", "code", code, "err", err)
 		}
 	}
@@ -186,6 +239,14 @@ func (l *Links) deleteExpired(ctx context.Context) error {
 	// backlog ever makes the statement hold locks for too long.
 	_, err := l.db.Exec(ctx, `DELETE FROM links WHERE expires_at <= now()`)
 	return err
+}
+
+// remaining converts seconds left until expiry, NULL for never, to a duration.
+func remaining(left *float64) time.Duration {
+	if left == nil {
+		return 0
+	}
+	return time.Duration(*left * float64(time.Second))
 }
 
 // ttlFor jitters base by ±10%, so links cached together do not all expire
