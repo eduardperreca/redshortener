@@ -43,6 +43,13 @@ With three app instances behind Caddy, which then serves port 8080. Add
 docker compose -f compose.yaml -f compose.scale.yaml up -d --build
 ```
 
+With a Redis Cluster of three primaries and three replicas, instead of the
+Sentinel setup:
+
+```sh
+docker compose -f compose.yaml -f compose.cluster.yaml up -d --build
+```
+
 ## API
 
 Create a link. `expires_in` is in seconds and optional; without it the link
@@ -82,7 +89,7 @@ without a user name or password, and not pointing to the shortener itself.
 | `ADDR`             | `:8080`                                                        |
 | `BASE_URL`         | `http://localhost:8080`, used to build short URLs              |
 | `DATABASE_URL`     | `postgres://redshortener:redshortener@localhost:5432/redshortener` |
-| `REDIS_ADDR`       | `localhost:6379`; comma-separated Sentinels with `REDIS_MASTER` |
+| `REDIS_ADDR`       | `localhost:6379`; several comma-separated addresses mean a Redis Cluster, or Sentinels with `REDIS_MASTER` |
 | `REDIS_MASTER`     | empty; the Sentinel master name to go through Sentinel         |
 | `DATABASE_READ_URL` | empty; a Postgres replica for cache misses and stats          |
 | `CLIENT_IP_HEADER` | empty: rate limit by the TCP peer address                      |
@@ -185,18 +192,20 @@ the same query should not fail with it.
 ### Counting clicks
 
 Writing to Postgres on every redirect would put the database back on the path
-the cache is there to protect. Instead, each redirect runs
+the cache is there to protect. Instead, each redirect runs, without waiting
+for the reply,
 
 ```
-HINCRBY clicks:pending <code> 1
+HINCRBY clicks:pending:<shard> <code> 1
 ```
 
-and every 10 seconds each instance moves the pending counts to Postgres:
+where the shard is a random number from 0 to 15. Every 10 seconds each
+instance moves the pending counts to Postgres, with one `MULTI` per shard:
 
 ```
 MULTI
-HGETALL clicks:pending
-DEL clicks:pending
+HGETALL clicks:pending:<shard>
+DEL clicks:pending:<shard>
 EXEC
 
 UPDATE links SET clicks = clicks + c.n
@@ -205,7 +214,9 @@ WHERE links.code = c.code
 ```
 
 `MULTI` runs both commands with nothing in between, so when several instances
-flush at the same moment, each count is taken by exactly one of them. If the
+flush at the same moment, each count is taken by exactly one of them. A code
+can be pending in several shards, so the counts are summed before the
+`UPDATE`, which would apply only one row per code otherwise. If the
 `UPDATE` fails, the counts go back into the hash with `HINCRBY` and the next
 flush retries them. That includes deadlocks between two instances updating the
 same rows in a different order: Postgres aborts one of them, and its counts are
@@ -214,6 +225,9 @@ retried.
 The cost is that a click is counted at most once, not exactly once. Counts are
 lost if the process dies after taking them and before writing them, or if Redis
 loses the hash. Click counts shown by the API lag behind by up to 10 seconds.
+
+Why 16 shards, and why the redirect does not wait for the count, is explained
+under [Redis Cluster](#redis-cluster).
 
 A first version used `RENAME clicks:pending clicks:flushing` instead of
 `MULTI`. It works, but a crash between the rename and the delete leaves a
@@ -308,7 +322,9 @@ Stopping the primary while sending a redirect and a create every 100 ms:
   ms budget, so redirects took up to 310 ms, creates up to 630 ms, and the loop
   went from 6 iterations a second to 1. Clicks and rate limiting stopped for
   those seconds. The app needed about 2 seconds after the promotion to send
-  writes to the new primary.
+  writes to the new primary. This was measured while the redirect still
+  waited for the click count; see [Redis Cluster](#redis-cluster) for why it
+  no longer does.
 - When the old primary came back, Sentinel made it a replica of the new one.
 
 Two things can go wrong in a failover that did not show in this test:
@@ -449,6 +465,74 @@ here: `pg_stat_database.deadlocks` stayed at 0.
 Metrics are per instance. Prometheus has to scrape each instance, not the load
 balancer, which would return a different instance's numbers on each scrape.
 
+### Redis Cluster
+
+With several addresses in `REDIS_ADDR` and no `REDIS_MASTER`, the app uses a
+Redis Cluster client. The key space is split into 16,384 slots, each owned by
+one primary, and a key's slot is a hash of its name. `compose.cluster.yaml`
+runs three primaries with one replica each, and `GET`s go to the replicas.
+
+Every key the app uses is a single key, so no command spans slots. Each
+`MULTI` touches one key too. A first version of the sharded click flush put
+all 16 shards in one pipeline, which go-redis rejects in a cluster with
+`CROSSSLOT`; the single-node tests could not show that.
+
+#### The click hash was one hot slot
+
+A key lives on one node, and all clicks went to one key. 300 redirects over
+10 links, with three app instances:
+
+| Node      | `GET` before | `HINCRBY` before | `HINCRBY` after sharding |
+| --------- | ------------ | ---------------- | ------------------------ |
+| primary 1 |              | 0                | 97                       |
+| primary 2 |              | 0                | 91                       |
+| primary 3 |              | 300              | 112                      |
+| replica 1 | 120          |                  |                          |
+| replica 2 | 90           |                  |                          |
+| replica 3 | 90           |                  |                          |
+
+The `GET`s spread because the codes hash to different slots. The click counts
+did not, so one primary took every click write however many shards the
+cluster had. They now go to one of 16 hashes, picked at random for every
+click. Picking by code would spread different links but not the clicks of one
+popular link, which is the case that matters.
+
+#### Failover
+
+Stopping one primary while four clients sent redirects in a loop, to 10 links
+spread over all shards, showed four problems, fixed one at a time and checked
+by running the test again.
+
+1. **The client kept using the dead node.** The cluster promoted the replica,
+   but the app sent commands to the stopped node until the end of the test,
+   26 seconds later. go-redis reloads the slot map after a `MOVED` reply or
+   every 60 seconds. A command to a stopped node gets neither: it runs out of
+   its 300 ms budget. The map is now reloaded every 2 seconds.
+2. **The reload was stuck.** It runs in the background with no deadline and
+   asks the nodes for the slot map in random order. When it picked the stopped
+   node, the default dial settings spent 5 attempts of 5 seconds on it before
+   trying the next. Dialing now gives up after 200 ms with no retry. After
+   that, the last error came 0.5 seconds after the promotion.
+3. **The whole cluster stopped.** From the moment the primary was marked as
+   failed until the promotion, every node answered every command with
+   `CLUSTERDOWN`, also for the slots of the two healthy primaries. That is
+   `cluster-require-full-coverage yes`, the default. For a cache, the healthy
+   shards should keep serving, so the compose setup sets it to `no`.
+4. **Redirects waited for the click.** While a shard had no primary, one click
+   in three went to it and used the whole budget before the redirect was sent.
+   Redirects fell from about 200 a second to 40. The click is now counted in a
+   goroutine of its own.
+
+The last round, with all of that in place:
+
+- The cluster marked the primary as failed and promoted its replica about 8
+  seconds after the stop (`cluster-node-timeout` is 5 seconds).
+- All 7,690 redirects returned `302`. Throughput stayed between 213 and 245
+  a second, and the slowest redirect took 60 ms.
+- 843 of 7,700 clicks were lost: those that went to the shard without a
+  primary, before the promotion. The app logged 853 failed click writes.
+- The last error came 1.3 seconds after the promotion.
+
 ### Redirect status
 
 Redirects use `302`. Browsers cache a `301` indefinitely, so later clicks would
@@ -484,7 +568,7 @@ the same database; CI has no replica and skips it.
 - v0.3: a Postgres streaming replica for reads, and the read-your-writes
   problem it brings. Done.
 - v0.4: several app instances behind Caddy. Done.
-- v0.5: Redis Cluster.
+- v0.5: Redis Cluster. Done.
 - v1.0: failover experiments, written up in `docs/`.
 
 ## References
@@ -494,6 +578,7 @@ the same database; CI has no replica and skips it.
 - Redis, [Key eviction](https://redis.io/docs/latest/develop/reference/eviction/).
 - Redis, [Replication](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/), including the safety of replication when the primary has persistence turned off.
 - Redis, [High availability with Sentinel](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/).
+- Redis, [Cluster specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/) and [scaling with Redis Cluster](https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/).
 - PostgreSQL, [Log-Shipping Standby Servers](https://www.postgresql.org/docs/current/warm-standby.html) and [synchronous_commit](https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT).
 - PostgreSQL, [Heap-Only Tuples](https://www.postgresql.org/docs/current/storage-hot.html).
 
