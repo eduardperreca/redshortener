@@ -1,0 +1,121 @@
+# COMPOSE_FILE=compose.yaml:compose.patroni.yaml docker compose up -d --build
+#
+# Three Postgres nodes managed by Patroni, which promotes a replica when the
+# primary fails. Use it instead of compose.pgreplica.yaml; it can be combined
+# with the Redis overlays and with compose.scale.yaml.
+#
+# The postgres service of compose.yaml becomes the first node, so it is not
+# always the primary. The app finds the primary itself: it lists all three
+# nodes and lets the driver pick by target_session_attrs.
+
+configs:
+  patroni:
+    content: |
+      scope: redshortener
+      restapi:
+        listen: 0.0.0.0:8008
+      etcd3:
+        host: etcd:2379
+      bootstrap:
+        dcs:
+          # A primary that has not renewed its leader key for ttl seconds is
+          # replaced. 20 is the lowest ttl Patroni accepts, and it requires
+          # loop_wait + 2 * retry_timeout <= ttl.
+          ttl: 20
+          loop_wait: 2
+          retry_timeout: 9
+          # Commits wait for one replica, and only that replica can be
+          # promoted, so a failover loses no committed link.
+          synchronous_mode: true
+          # Without etcd, a primary keeps running as long as it can reach the
+          # other nodes, instead of stepping down.
+          failsafe_mode: true
+          postgresql:
+            use_pg_rewind: true
+        # Patroni appends the connection string, which psql takes as dbname.
+        post_bootstrap: >-
+          psql -c "CREATE ROLE redshortener LOGIN PASSWORD 'redshortener'"
+          -c "CREATE DATABASE redshortener OWNER redshortener"
+      postgresql:
+        listen: 0.0.0.0:5432
+        data_dir: /var/lib/postgresql/patroni
+        # pg_basebackup otherwise waits for a spread checkpoint, minutes on
+        # an idle primary, before a new replica can start copying.
+        basebackup:
+          - checkpoint: fast
+        authentication:
+          superuser: { username: postgres, password: postgres }
+          replication: { username: replicator, password: replicator }
+        pg_hba:
+          - local all all trust
+          - host replication replicator all scram-sha-256
+          - host all all all scram-sha-256
+
+x-patroni: &patroni
+  image: redshortener-patroni
+  build:
+    dockerfile_inline: |
+      FROM postgres:18
+      RUN apt-get update \
+        && apt-get install -y --no-install-recommends patroni python3-etcd python3-etcd3 \
+        && rm -rf /var/lib/apt/lists/*
+  user: postgres
+  command: patroni /etc/patroni.yaml
+  configs:
+    - source: patroni
+      target: /etc/patroni.yaml
+  depends_on:
+    etcd: { condition: service_started }
+  healthcheck:
+    test: pg_isready -h localhost -U redshortener
+    interval: 1s
+    start_period: 60s
+
+services:
+  app:
+    environment:
+      DATABASE_URL: postgres://redshortener:redshortener@postgres,postgres2,postgres3/redshortener?target_session_attrs=read-write&connect_timeout=2
+      DATABASE_READ_URL: postgres://redshortener:redshortener@postgres,postgres2,postgres3/redshortener?target_session_attrs=prefer-standby&connect_timeout=2
+    depends_on:
+      postgres2: { condition: service_healthy }
+      postgres3: { condition: service_healthy }
+
+  # ponytail: one etcd node, so etcd itself is not replicated; failsafe_mode
+  # keeps the primary up without it. Run three for a real deployment.
+  etcd:
+    image: quay.io/coreos/etcd:v3.6.5
+    command: >-
+      etcd --data-dir /tmp/etcd
+      --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://etcd:2379
+
+  postgres:
+    <<: *patroni
+    environment:
+      PATRONI_NAME: postgres
+      PATRONI_RESTAPI_CONNECT_ADDRESS: postgres:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: postgres:5432
+    volumes: !override
+      - patroni1:/var/lib/postgresql
+
+  postgres2:
+    <<: *patroni
+    environment:
+      PATRONI_NAME: postgres2
+      PATRONI_RESTAPI_CONNECT_ADDRESS: postgres2:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: postgres2:5432
+    volumes:
+      - patroni2:/var/lib/postgresql
+
+  postgres3:
+    <<: *patroni
+    environment:
+      PATRONI_NAME: postgres3
+      PATRONI_RESTAPI_CONNECT_ADDRESS: postgres3:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: postgres3:5432
+    volumes:
+      - patroni3:/var/lib/postgresql
+
+volumes:
+  patroni1:
+  patroni2:
+  patroni3:
