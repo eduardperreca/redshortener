@@ -76,7 +76,7 @@ curl -X POST localhost:8080/api/links -d '{"url": "https://go.dev/doc/", "expire
 | `GET /{code}`            | `302` to the URL, `404` if the code is unknown or expired    |
 | `GET /api/links/{code}`  | `200` with the link and its click count, `404`               |
 | `GET /healthz`           | `200` while the process is up                                |
-| `GET /readyz`            | `200` when Postgres answers, `503` otherwise                 |
+| `GET /readyz`            | `200` when Postgres or Redis answers, `503` otherwise        |
 | `GET /metrics`           | Prometheus metrics                                           |
 
 Accepted URLs are absolute `http` or `https` URLs of at most 2048 bytes,
@@ -263,7 +263,8 @@ unavailable:
   retry included. The budget is a go-redis hook that sets a context deadline,
   and `ContextTimeoutEnabled` makes the deadline apply to socket reads and
   writes as well.
-- `/readyz` only checks Postgres, so a load balancer keeps sending traffic.
+- `/readyz` passes while Postgres answers, so a load balancer keeps sending
+  traffic.
 - The rate limiter, [redlimit](https://github.com/eduardperreca/redlimit),
   fails open: link creation is not limited while Redis is down.
 - Clicks are not counted.
@@ -451,8 +452,8 @@ Other ways to get read-your-writes, not used here:
 
 #### When the replica is down
 
-Reads go to the primary after the replica fails, and `/readyz` only checks the
-primary. A replica that hangs instead of refusing connections makes each read
+Reads go to the primary after the replica fails, and `/readyz` does not check
+the replica. A replica that hangs instead of refusing connections makes each read
 wait for the connection attempt first; set `connect_timeout` in
 `DATABASE_READ_URL` to bound that.
 

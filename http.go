@@ -124,11 +124,18 @@ func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
 	})
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {})
-	// Redis is only a cache: without it lookups go to Postgres. So only
-	// Postgres decides whether this instance is ready.
+	// Ready while either store answers: without Redis, lookups go to
+	// Postgres, and without Postgres, cached links still redirect. Every
+	// instance shares both stores, so failing on one of them would take all
+	// instances out of a load balancer at once, during a Postgres failover
+	// for example.
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		if err := links.db.Ping(r.Context()); err != nil {
-			http.Error(w, "postgres: "+err.Error(), http.StatusServiceUnavailable)
+		perr := links.db.Ping(r.Context())
+		if perr == nil {
+			return
+		}
+		if rerr := links.rdb.Ping(r.Context()).Err(); rerr != nil {
+			http.Error(w, "postgres: "+perr.Error()+"\nredis: "+rerr.Error(), http.StatusServiceUnavailable)
 		}
 	})
 	mux.Handle("GET /metrics", promhttp.Handler())
