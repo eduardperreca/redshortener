@@ -54,6 +54,9 @@
       <option value="604800">After 7 days</option>
       <option value="2592000">After 30 days</option>
     </select>
+    <label for="alias">Custom alias, optional</label>
+    <input id="alias" name="alias" pattern="[0-9A-Za-z_\-]{3,32}" placeholder="my-link"
+           title="3 to 32 letters, digits, - or _" autocomplete="off" spellcheck="false">
   </form>
   <div id="result" aria-live="polite"></div>
 </main>
@@ -67,7 +70,11 @@
     const res = await fetch("/api/links", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: form.url.value, expires_in: Number(form.expires.value) }),
+      body: JSON.stringify({
+        url: form.url.value,
+        expires_in: Number(form.expires.value),
+        alias: form.alias.value,
+      }),
     });
     const body = await res.json().catch(() => ({ error: res.statusText }));
     if (!res.ok) {
