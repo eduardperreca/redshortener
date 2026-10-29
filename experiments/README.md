@@ -37,6 +37,27 @@ Expect the Redis replica to have the key nearly every time, and the Postgres
 replica to miss nearly every row by a millisecond or two. See
 [What the experiments showed](../README.md#what-the-experiments-showed).
 
+## Stale cache after a change
+
+[`staleset`](staleset/main.go) changes one link 500 times while 8 readers
+keep its cache entry filled from a Postgres replica, and counts the changes
+after which the cache still holds the previous URL. `-mode naive` invalidates
+with `UPDATE` then `DEL`; `-mode app` does what the app does. Needs
+`compose.patroni.yaml`.
+
+```sh
+docker run --rm --network redshortener_default -v "$PWD":/src -w /src golang:1.26 \
+  go run ./experiments/staleset -mode naive -n 2000
+```
+
+```
+naive: 22 of 2000 changes left an old URL in the cache
+app: 0 of 2000 changes left an old URL in the cache
+```
+
+With `-replica` pointing at the primary, naive left none either: the race
+needs the replica's lag.
+
 ## Failover
 
 [`failover.sh`](failover.sh) creates 10 links, sends redirects to them from 4

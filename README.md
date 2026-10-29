@@ -109,6 +109,7 @@ Each line is a measurement; the scripts are in [`experiments/`](experiments/).
 | Stop etcd under Patroni                             | writes continue with `failsafe_mode`, all fail without it |
 | Stop and kill app instances behind Caddy            | 0 of 5,842 requests failed                              |
 | Fill Redis until it evicts                          | `volatile-lfu` kept 16 of 16 click hashes, `allkeys-lru` 7 |
+| Change a link 2,000 times, readers on the replica   | `UPDATE` + `DEL` left the old URL cached 22 times, the app's way 0 |
 
 ## Bugs the experiments found
 
@@ -127,6 +128,9 @@ Each line is a measurement; the scripts are in [`experiments/`](experiments/).
   during a failover. The click is now written in the background.
 - `WAIT` only counts writes made on its own connection, so it must run on the
   connection that ran the `MULTI`.
+- Invalidating with `UPDATE` then `DEL` caches old URLs: a reader misses
+  right after the `DEL` and reads a replica that is a millisecond behind.
+  Reading the primary, it did not happen in 2,000 changes.
 - `/readyz` checked only Postgres, so every instance reported unready during a
   Postgres failover while redirects worked fine.
 - Patroni refuses a `ttl` under 20 s, and a new replica waited minutes for a
