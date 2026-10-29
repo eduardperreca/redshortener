@@ -357,13 +357,12 @@ promotes the replica with the most data, which is the one that confirmed
 unless the other caught up after. It was not reproduced here, because the
 window is a fraction of a millisecond wide.
 
-One more thing can go wrong in a failover that did not show in this test:
-
-- Redis runs without persistence here. If a primary restarts fast enough that
-  Sentinel has not yet failed over, it comes back empty, and the replicas
-  resync from it and empty themselves too. For a cache that means a cold start
-  and lost click counts. If the data mattered, the primary would need
-  persistence, or must not be restarted automatically.
+One more thing can go wrong that did not show in this test. Redis runs
+without persistence here. If a primary restarts fast enough that Sentinel has
+not yet failed over, it comes back empty, and the replicas resync from it and
+empty themselves too. For a cache that means a cold start and lost click
+counts. If the data mattered, the primary would need persistence, or must not
+be restarted automatically.
 
 ### Redis configuration
 
