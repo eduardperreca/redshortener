@@ -35,8 +35,7 @@ docker run --rm --network redshortener_default -v "$PWD":/src -w /src golang:1.2
 
 Expect the Redis replica to have the key nearly every time, and the Postgres
 replica to miss nearly every row by a millisecond or two. See
-[Stale reads](../README.md#stale-reads) and
-[How far behind the replica is](../README.md#how-far-behind-the-replica-is).
+[What the experiments showed](../README.md#what-the-experiments-showed).
 
 ## Failover
 
@@ -62,10 +61,8 @@ with `SIGTERM`, kills another with `SIGKILL` 5 seconds later, and starts both
 Expect no failed redirects in any of them. With `postgres`, creates fail for
 about 20 seconds and no created link is missing. During a Redis failover, click
 writes to the missing primary fail and are logged as `counting click` until a
-replica takes over. See [Failover](../README.md#failover),
-[Redis Cluster](../README.md#redis-cluster),
-[Postgres failover](../README.md#postgres-failover) and
-[Several app instances](../README.md#several-app-instances).
+replica takes over. See
+[What the experiments showed](../README.md#what-the-experiments-showed).
 
 ## Eviction
 

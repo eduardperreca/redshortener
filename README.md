@@ -1,671 +1,129 @@
 # redshortener
 
-A URL shortener written in Go. Links are stored in Postgres, and Redis caches
-lookups in front of it.
+A URL shortener in Go: links live in Postgres, Redis caches them. Built to
+learn how a cache and a database behave together, with replicas and failures.
 
-The project exists to study how a cache and a database work together, and what
-changes when each of them gets replicas. The design notes below explain every
-choice and the failure it guards against.
-
-## Running it
-
-```sh
-docker compose up -d --build
+```
+redirect:  app ── GET ──────► Redis ── miss ─────────► Postgres
+click:     app ── HINCRBY ──► Redis ── every 10 s ───► Postgres
 ```
 
-Open http://localhost:8080. To run the app outside Docker, start only the
-stores:
+## Run
 
 ```sh
-docker compose up -d postgres redis
-go run .
+docker compose up -d --build     # http://localhost:8080
 ```
 
-With a Redis primary, two replicas and three Sentinels instead of a single
-Redis:
+Extra compose files add replicas. Combine them with `COMPOSE_FILE`:
 
 ```sh
-docker compose -f compose.yaml -f compose.sentinel.yaml up -d --build
+COMPOSE_FILE=compose.yaml:compose.patroni.yaml:compose.scale.yaml docker compose up -d --build
 ```
 
-With a Postgres streaming replica for reads, alone or together with the
-Sentinel setup:
+| File                   | Adds                                                   |
+| ---------------------- | ------------------------------------------------------ |
+| `compose.sentinel.yaml`  | Redis primary, 2 replicas, 3 Sentinels                 |
+| `compose.cluster.yaml`   | Redis Cluster, 3 primaries and 3 replicas              |
+| `compose.pgreplica.yaml` | a Postgres read replica                                |
+| `compose.patroni.yaml`   | 3 Postgres nodes with automatic failover (Patroni)     |
+| `compose.scale.yaml`     | 3 app instances behind Caddy                           |
 
-```sh
-docker compose -f compose.yaml -f compose.pgreplica.yaml up -d --build
-docker compose -f compose.yaml -f compose.sentinel.yaml -f compose.pgreplica.yaml up -d --build
-```
-
-With three Postgres nodes under Patroni, which fails over the primary, instead
-of the streaming replica:
-
-```sh
-docker compose -f compose.yaml -f compose.patroni.yaml up -d --build
-```
-
-With three app instances behind Caddy, which then serves port 8080. Add
-`-f compose.scale.yaml` to any of the commands above:
-
-```sh
-docker compose -f compose.yaml -f compose.scale.yaml up -d --build
-```
-
-With a Redis Cluster of three primaries and three replicas, instead of the
-Sentinel setup:
-
-```sh
-docker compose -f compose.yaml -f compose.cluster.yaml up -d --build
-```
+Use at most one Redis file and one Postgres file.
 
 ## API
 
-Create a link. `expires_in` is in seconds and optional; without it the link
-never expires. `alias` is optional too; without it the link gets a random
-code.
-
 ```sh
-curl -X POST localhost:8080/api/links -d '{"url": "https://go.dev/doc/", "expires_in": 3600}'
+curl -X POST localhost:8080/api/links -d '{"url": "https://go.dev", "alias": "go", "expires_in": 3600}'
 ```
 
-```json
-{
-  "code": "tsLRfhS",
-  "url": "https://go.dev/doc/",
-  "created_at": "2026-10-28T19:22:34.511066Z",
-  "expires_at": "2026-10-28T20:22:34.511066Z",
-  "clicks": 0,
-  "short_url": "http://localhost:8080/tsLRfhS"
-}
-```
+`alias` and `expires_in` (seconds) are optional. Without an alias the link
+gets a random 7-character code.
 
-| Request                  | Response                                                     |
-| ------------------------ | ------------------------------------------------------------ |
-| `POST /api/links`        | `201` with the link, `400` with `{"error": ...}`, `409` if the alias is taken, `429` when rate limited |
-| `GET /{code}`            | `302` to the URL, `404` if the code is unknown or expired    |
-| `GET /api/links/{code}`  | `200` with the link and its click count, `404`               |
-| `GET /healthz`           | `200` while the process is up                                |
-| `GET /readyz`            | `200` when Postgres or Redis answers, `503` otherwise        |
-| `GET /metrics`           | Prometheus metrics                                           |
-
-Accepted URLs are absolute `http` or `https` URLs of at most 2048 bytes,
-without a user name or password, and not pointing to the shortener itself.
+| Request                 | Response                                                        |
+| ----------------------- | --------------------------------------------------------------- |
+| `POST /api/links`       | `201` link, `400` bad input, `409` alias taken, `429` rate limited |
+| `GET /{code}`           | `302` to the URL, `404`                                         |
+| `GET /api/links/{code}` | `200` link with click count, `404`                              |
+| `GET /healthz`          | `200` while the process runs                                    |
+| `GET /readyz`           | `200` if Postgres or Redis answers                              |
+| `GET /metrics`          | Prometheus                                                      |
 
 ## Configuration
 
-| Variable           | Default                                                        |
-| ------------------ | -------------------------------------------------------------- |
-| `ADDR`             | `:8080`                                                        |
-| `BASE_URL`         | `http://localhost:8080`, used to build short URLs              |
-| `DATABASE_URL`     | `postgres://redshortener:redshortener@localhost:5432/redshortener` |
-| `REDIS_ADDR`       | `localhost:6379`; several comma-separated addresses mean a Redis Cluster, or Sentinels with `REDIS_MASTER` |
-| `REDIS_MASTER`     | empty; the Sentinel master name to go through Sentinel         |
-| `DATABASE_READ_URL` | empty; a Postgres replica for cache misses and stats          |
-| `CLIENT_IP_HEADER` | empty: rate limit by the TCP peer address                      |
-
-Behind a reverse proxy, every request comes from the proxy, so all clients
-would share one rate limit. Set `CLIENT_IP_HEADER` to the header the proxy
-writes the client address into, such as `X-Real-IP`, and only when the proxy
-overwrites it: otherwise clients can set it themselves.
+| Variable            | Meaning                                                    |
+| ------------------- | ---------------------------------------------------------- |
+| `DATABASE_URL`      | Postgres primary                                           |
+| `DATABASE_READ_URL` | optional Postgres replica for reads                        |
+| `REDIS_ADDR`        | one address, or several for a Cluster or for Sentinels     |
+| `REDIS_MASTER`      | Sentinel master name; set it to use Sentinel               |
+| `BASE_URL`          | used to build short URLs, default `http://localhost:8080`  |
+| `ADDR`              | listen address, default `:8080`                            |
+| `CLIENT_IP_HEADER`  | header with the client IP, behind a proxy that overwrites it |
 
 ## How it works
 
-### Codes
-
-A code is 7 random characters from `[0-9A-Za-z]`, read from `crypto/rand`.
-That is 62⁷, about 3.5·10¹², possible codes. The code is the primary key, and
-the insert uses `ON CONFLICT DO NOTHING`, so Postgres rejects a duplicate and
-the app draws again.
-
-A counter encoded in base 62 would give shorter codes and never collide, but
-anyone could walk through every link by counting. Random codes cannot be
-guessed and need no shared counter.
-
-A link can have an alias instead, 3 to 32 characters from `[0-9A-Za-z_-]`,
-case-sensitive like the codes. Aliases and codes share the primary key, so
-there is nothing to check before the insert: of two requests for the same
-alias, Postgres lets one insert the row, and the other gets `409`. A check
-followed by an insert would let both pass the check. An alias whose link has
-expired can be taken again at once; the insert overwrites the old row instead
-of waiting for the hourly purge to delete it. `healthz`, `readyz` and
-`metrics` are refused, because those paths are routes of their own.
-
-Requests for anything that is not a well-formed code or alias get a `404`
-before they reach Redis or Postgres.
-
-### Reading a link
-
-Lookups follow the cache-aside pattern:
-
-```
-GET link:{code}                  hit: redirect
-                                 miss:
-SELECT url ... WHERE code = $1
-SET link:{code} <url> EX <ttl>   then redirect
-```
-
-Postgres stays the only source of truth. Everything in Redis can be thrown away
-and rebuilt from it.
-
-The TTL is 24 hours with 10% random jitter, so links cached at the same time do
-not all expire, and miss, at the same moment. For a link that expires sooner,
-the TTL is cut to the time it has left, computed by Postgres from its own clock,
-so that app servers with skewed clocks cannot keep an expired link alive.
-
-### Links that do not exist
-
-A client probing random codes would miss the cache on every request and send
-every request to Postgres. To stop that, "not found" is cached too, as an empty
-string, for 60 seconds.
-
-Negative entries open a race. A lookup can miss in Postgres just before the
-link is created, and write its "not found" just after:
-
-```
-lookup                          create
-SELECT -> no row
-                                INSERT
-                                DEL link:{code}
-SET link:{code} ""              (the new link is now hidden for 60s)
-```
-
-This is the stale set problem described in the Memcache at Facebook paper. The
-fix here relies on links never changing once created:
-
-- Creating a link writes it into the cache with a plain `SET`, which replaces
-  any negative entry.
-- Lookups write negative entries with `SET NX`, which does nothing if the key
-  exists, so a late negative entry cannot replace a real one.
-
-One window remains: if the `SET` on creation fails because Redis is
-unreachable, a negative entry written earlier can hide the link for up to 60
-seconds.
-
-### When a popular link drops out of the cache
-
-When a link that gets thousands of requests per second expires from Redis,
-all of those requests miss at once and query Postgres for the same row. This
-is a cache stampede.
-
-Each instance runs lookups through `singleflight`: concurrent misses on the
-same code wait for one query and share its result. Sending 300 requests, 100
-at a time, at a link just removed from the cache gave 8 misses and 292 hits:
-the requests that arrived while the query ran waited for it, and the rest
-found the link back in the cache.
-
-The protection is per instance, so with N instances Postgres still sees up to
-N queries. Two known ways to go further were left out:
-
-- Leases (Memcache at Facebook): the cache hands out one token per key, and
-  only the holder may query the database. It is cluster-wide, but needs either
-  a cache server that supports it or a lock emulated in Redis.
-- Probabilistic early expiration (XFetch, Vattani et al.): each request may
-  refresh an entry before it expires, with a probability that rises as expiry
-  approaches. Hot keys are refreshed before they miss, without coordination.
-
-Both pay off when loading an entry is slow, and here it is a lookup by primary
-key that takes about a millisecond. A stampede costs what arrives while the
-query runs: at 1,000 requests a second on one link, about one request per
-instance waits, once a day when the entry expires. XFetch refreshes a request
-early with probability e^(-r/βδ), where r is the time left and δ the time a
-load takes, so with δ = 1 ms it only acts in the last few milliseconds of a
-24 hour TTL. At 1,000 requests a second and β = 1, it refreshes ahead of
-expiry about 63% of the time, and the misses it saves the other times are the
-same one query per instance. A lease would turn up to N queries into one, but
-adds a round trip to every miss to take the lease.
-
-The shared query runs with its own 5 second timeout instead of the first
-caller's context, because if that client disconnects, the others waiting on
-the same query should not fail with it.
-
-### Counting clicks
-
-Writing to Postgres on every redirect would put the database back on the path
-the cache is there to protect. Instead, each redirect runs, without waiting
-for the reply,
-
-```
-HINCRBY clicks:pending:<shard> <code> 1
-```
-
-where the shard is a random number from 0 to 15. Every 10 seconds each
-instance moves the pending counts to Postgres, with one `MULTI` per shard:
-
-```
-MULTI
-HGETALL clicks:pending:<shard>
-DEL clicks:pending:<shard>
-EXEC
-
-UPDATE links SET clicks = clicks + c.n
-FROM unnest($codes, $counts) AS c(code, n)
-WHERE links.code = c.code
-```
-
-followed, on the same connection, by
-
-```
-WAIT 1 50
-```
-
-`MULTI` runs both commands with nothing in between, so when several instances
-flush at the same moment, each count is taken by exactly one of them. `WAIT`
-is explained under [Failover](#failover). A code
-can be pending in several shards, so the counts are summed before the
-`UPDATE`, which would apply only one row per code otherwise. If the
-`UPDATE` fails, the counts go back into the hash with `HINCRBY` and the next
-flush retries them. That includes deadlocks between two instances updating the
-same rows in a different order: Postgres aborts one of them, and its counts are
-retried.
-
-The cost is that a click is counted at most once, not exactly once. Counts are
-lost if the process dies after taking them and before writing them, if Redis
-loses the hash, or if they were sent to a Redis primary that failed before
-passing them on. Click counts shown by the API lag behind by up to 10 seconds.
-
-Why 16 shards, and why the redirect does not wait for the count, is explained
-under [Redis Cluster](#redis-cluster).
-
-A first version used `RENAME clicks:pending clicks:flushing` instead of
-`MULTI`. It works, but a crash between the rename and the delete leaves a
-`clicks:flushing` key behind, and recovering it safely with several instances
-is harder than not creating it.
-
-### When Redis is down
-
-Redis is a cache, so its failure should make the service slower, not
-unavailable:
-
-- Lookups that fail in Redis go to Postgres, still through `singleflight`.
-- Every Redis command or pipeline gets 300 ms in total, dialing and the one
-  retry included. The budget is a go-redis hook that sets a context deadline,
-  and `ContextTimeoutEnabled` makes the deadline apply to socket reads and
-  writes as well.
-- `/readyz` passes while Postgres answers, so a load balancer keeps sending
-  traffic.
-- The rate limiter, [redlimit](https://github.com/eduardperreca/redlimit),
-  fails open: link creation is not limited while Redis is down.
-- Clicks are not counted.
-
-A budget is needed because per-step timeouts do not add up to a bound. The
-first version set a 1 second dial timeout, 200 ms read and write timeouts and
-one retry, which looks like at most a few hundred milliseconds. But go-redis
-also retries dialing 5 times per attempt, each time with the full dial
-timeout. When the Redis primary was stopped during a test, a rate-limited
-create spent 5 seconds dialing, retried, spent 5 more, and was cut off by the
-server's 10 second write timeout.
-
-### Redis replicas
-
-With `REDIS_MASTER` set, the app asks the Sentinels in `REDIS_ADDR` where the
-primary is and reads links from the replicas. Redis replicates asynchronously:
-the primary answers a write before the replicas have it.
-
-#### Which command goes where
-
-The client is a go-redis failover cluster client with `ReplicaOnly`. It treats
-the primary and its replicas as one shard of a cluster, sends commands that
-Redis flags as read-only to a replica, and everything else to the primary.
-
-| Command                        | Node    |
-| ------------------------------ | ------- |
-| `GET link:{code}`              | replica |
-| `SET`, `SET NX`, `HINCRBY`     | primary |
-| `MULTI` (click flush)          | primary |
-| `EVALSHA` (rate limiter)       | primary |
-
-This was checked with `INFO commandstats` on each node: 50 redirects gave 25
-`GET`s on each replica and none on the primary.
-
-The obvious configuration does something else. `NewUniversalClient` with a
-`MasterName` and `ReadOnly: true` returns a plain failover client with
-`ReplicaOnly`, which connects only to replicas and sends them the writes too.
-Those fail with `READONLY`. Routing by command needs
-`NewFailoverClusterClient`, or `RouteRandomly`, which spreads reads over the
-primary and the replicas.
-
-#### Stale reads
-
-A read from a replica can return an older value than the primary holds. Here
-that matters in two places:
-
-- A link read right after it is created can miss on the replica. That costs
-  one Postgres query, then the link is cached.
-- If a code was probed in the last 60 seconds, the replica can still hold the
-  negative entry after the primary has replaced it with the new link. The link
-  then reads as not found until the replica catches up.
-
-In practice the window is small. 10,000 rounds of `SET` on the primary followed
-right away by `GET` on a replica, from the same client, found the key on the
-replica every time, also with 8 other connections writing 100 KB values to the
-primary. Redis sends a write to its replicas in the same event loop iteration
-as the reply to the client, so a stale read needs a replication link that is
-slower than the client's own round trip to the replica: a replica in another
-zone, a congested network, or a replica that is still resyncing.
-
-Replicas never delete expired keys on their own; they wait for the `DEL` from
-the primary. They do answer reads of a key that is past its TTL as if it did
-not exist, so a link whose cache entry has expired is not served from a
-replica.
-
-#### Failover
-
-Stopping the primary while sending a redirect and a create every 100 ms:
-
-- The Sentinels agreed the primary was down after 5 seconds
-  (`down-after-milliseconds`) and promoted a replica 1.2 seconds later.
-- All 202 redirects and all 202 creates succeeded. Redirects kept hitting the
-  cache on the replicas.
-- From 2 to 8 seconds after the stop, each write to Redis used its whole 300
-  ms budget, so redirects took up to 310 ms, creates up to 630 ms, and the loop
-  went from 6 iterations a second to 1. Clicks and rate limiting stopped for
-  those seconds. The app needed about 2 seconds after the promotion to send
-  writes to the new primary. This was measured while the redirect still
-  waited for the click count; see [Redis Cluster](#redis-cluster) for why it
-  no longer does.
-- When the old primary came back, Sentinel made it a replica of the new one.
-
-Writes the old primary accepted but had not sent to a replica are lost. For
-the cache that means misses. For the click flush it could mean counting twice:
-if the primary answers `MULTI { HGETALL, DEL }` and dies before the `DEL`
-reaches a replica, the new primary still has the counts, and the next flush
-takes them again. So after the `MULTI` the app sends `WAIT 1 50`, which
-returns once one replica has every write made on that connection so far, or
-after 50 ms. The two must share a connection: `WAIT` sent on another one from
-the pool returns at once, because that connection wrote nothing. The app then:
-
-- writes the counts to Postgres if `WAIT` answered, whatever the number. With
-  healthy replicas it answered 1 within a millisecond. 0 means no replica
-  confirmed in time; without replicas that is always the answer, after 50 ms.
-- drops the counts if the primary is gone before answering. Either the replica
-  has them and they are flushed after its promotion, or it does not and they
-  are lost. Neither counts a click twice.
-
-This closes the window only if the promoted replica is the one that
-confirmed: with two replicas, `WAIT 1` is satisfied by either of them. Sentinel
-promotes the replica with the most data, which is the one that confirmed
-unless the other caught up after. It was not reproduced here, because the
-window is a fraction of a millisecond wide.
-
-One more thing can go wrong that did not show in this test. Redis runs
-without persistence here. If a primary restarts fast enough that Sentinel has
-not yet failed over, it comes back empty, and the replicas resync from it and
-empty themselves too. For a cache that means a cold start and lost click
-counts. If the data mattered, the primary would need persistence, or must not
-be restarted automatically.
-
-### Redis configuration
-
-`compose.yaml` runs Redis as a cache: 100 MB of memory, no RDB snapshots, no
-AOF. Nothing in it needs to survive a restart except the pending click counts,
-and losing those is accepted above.
-
-The eviction policy is `volatile-lfu`. It only evicts keys that have a TTL,
-which keeps the pending click hashes safe, and it prefers to evict rarely used
-links over recently used ones, which suits traffic where a few links get most
-of the clicks.
-
-Filling a 4 MB Redis with 40,000 cached links evicted about 18,000 keys under
-either policy. Under `volatile-lfu` all 16 click hashes were still there;
-under `allkeys-lru`, 7 were.
-
-### Postgres
-
-- The table is created with `fillfactor = 90`. Click updates change no indexed
-  column, so with free space on the page Postgres can make them HOT updates:
-  the new row version stays on the same page and no index is touched.
-- A partial index on `expires_at` covers only links that expire. Expired links
-  are deleted once an hour.
-- Migrations in `migrations/` run at startup in one transaction, behind an
-  advisory lock, so instances that start together wait for each other.
-
-### Postgres replica
-
-With `DATABASE_READ_URL` set, cache misses and `GET /api/links/{code}` read
-from a streaming replica. Creating links, flushing clicks and deleting expired
-links stay on the primary.
-
-#### How far behind the replica is
-
-Postgres confirms a commit once the WAL is flushed on the primary. The
-replica receives the WAL after that, writes it and replays it, so a read on
-the replica right after a commit usually comes too early. 2,000 rounds of
-`INSERT` on the primary followed by `SELECT` of the same row on the replica:
-
-| Primary load        | Rows missing on the replica | Time until visible |
-| ------------------- | --------------------------- | ------------------ |
-| none                | 1,995 of 2,000              | p50 0.9 ms, p99 2.2 ms, max 6.5 ms |
-| 8 concurrent writers | 1,999 of 2,000             | p50 2.3 ms, p99 5.6 ms, max 31 ms  |
-
-That is the opposite of the Redis result above, where the replica had every
-key by the time the client asked.
-
-#### Read-your-writes
-
-Creating a link writes it to the cache, so it is normally read from Redis,
-not from the replica. When that write did not happen, because Redis was
-unreachable or evicted the key, a redirect right after the create misses the
-cache and asks the replica, which most likely does not have the row yet. On
-its own that is a 404 for a few milliseconds. Combined with negative caching
-it is worse: the "not found" is written to Redis and the link stays hidden for
-a minute.
-
-So a read that finds no row on the replica, or fails there, runs again on the
-primary, and only a "not found" from the primary is cached. Unknown codes cost
-two queries the first time and are then served from the negative cache.
-`TestReadAfterCreate` creates a link, removes it from the cache and resolves it
-right away, 100 times. Without the retry on the primary it fails in the first
-round.
-
-Other ways to get read-your-writes, not used here:
-
-- Remember the primary's WAL position after the insert
-  (`pg_current_wal_lsn()`) and read from the replica only once
-  `pg_last_wal_replay_lsn()` there has reached it. Exact, but the position has
-  to travel with the client, in a cookie for example.
-- `synchronous_commit = remote_apply` with the replica listed in
-  `synchronous_standby_names`: the commit returns only after the replica has
-  applied it. Every insert then waits for the replica, and stops if the replica
-  is down.
-
-#### When the replica is down
-
-Reads go to the primary after the replica fails, and `/readyz` does not check
-the replica. A replica that hangs instead of refusing connections makes each read
-wait for the connection attempt first; set `connect_timeout` in
-`DATABASE_READ_URL` to bound that.
-
-The app does not fail over the primary itself; see
-[Postgres failover](#postgres-failover).
-
-### Postgres failover
-
-`compose.patroni.yaml` runs three Postgres nodes under Patroni, with the leader
-key in etcd. The primary renews the key every 2 seconds. When it stops, a
-replica takes the key and is promoted, and the old primary comes back as a
-replica of the new one, after `pg_rewind` if their histories diverged.
-
-The app has no code for this. Both URLs name all three nodes, and the driver
-connects to the first one that has the role asked for in
-`target_session_attrs`:
-
-```
-DATABASE_URL=postgres://...@postgres,postgres2,postgres3/redshortener?target_session_attrs=read-write
-DATABASE_READ_URL=postgres://...@postgres,postgres2,postgres3/redshortener?target_session_attrs=prefer-standby
-```
-
-A pooled connection to a primary that went away fails once and is dropped,
-and the next one finds the new primary.
-
-Killing the primary with `SIGKILL`, while four clients sent redirects and one
-created a link every second (`experiments/failover.sh postgres`):
-
-- All 8,600 redirects succeeded, the slowest in 120 ms. Redirects of cached
-  links never reach Postgres.
-- Creates failed for 19 seconds. Nothing tells etcd that a killed primary is
-  gone, so its key has to expire first, after `ttl` seconds: 20 here, the
-  lowest Patroni accepts. Stopping the primary with `SIGTERM` instead, Patroni
-  gives up the key on the way down, and 2 creates failed.
-- All 14 links created before and after were there afterwards.
-- Click flushes that failed put their counts back in Redis. Over this run, an
-  earlier one and the `SIGTERM` test, Postgres counted 17,645 clicks for
-  17,645 redirects.
-- The killed primary came back as a replica after `pg_rewind`, which threw
-  away the WAL it had written after the new primary's history split off.
-
-Two settings make this safe:
-
-- `synchronous_mode: true`. A commit waits until one replica has flushed it,
-  and Patroni only promotes that replica. Without it, a link created just
-  before a crash can exist only on the dead primary: the app answered `201`
-  and cached the link, so it redirects for up to a day and is then gone. The
-  WAL that `pg_rewind` discards can hold commits too, but only ones the app
-  never got an answer for. The cost is one round trip to the replica on every commit. When no
-  replica is left, Patroni turns synchronous replication off rather than stop
-  writes; `synchronous_mode_strict` would stop them.
-- `failsafe_mode: true`. A primary that cannot reach etcd cannot tell whether
-  another node took over, so by default it steps down. With failsafe mode off
-  and etcd stopped, every create failed from 6 seconds after the stop until
-  etcd came back. With it on, the primary asks the other nodes over Patroni's
-  REST API instead, and keeps running while all of them answer: 40 creates
-  out of 40 succeeded during 40 seconds without etcd.
-
-`/readyz` used to check only the Postgres primary. During the failover it
-answered `503` on all three instances for 19 seconds, while every redirect
-succeeded; a load balancer that followed it would have turned those into
-errors too. It now passes while either Postgres or Redis answers.
-
-This setup runs a single etcd node, which is not replicated itself; a
-deployment would run three. All nodes share one Docker host, so nothing here
-tests a network partition.
-
-### Several app instances
-
-The app keeps no state of its own between requests: the cache, the pending
-click counts and the rate limits live in Redis, the links in Postgres. So
-instances can be added behind a load balancer without changes.
-`compose.scale.yaml` runs three behind Caddy, with all the other compose files
-included, and the following was checked there.
-
-**Migrations run once.** The three instances started at the same moment on an
-empty database. One applied the migration; the other two waited on the
-advisory lock and then found it applied.
-
-**The rate limit is shared.** Twelve creates from one client gave ten `201`s
-and two `429`s. The `201`s were served by the instances 2, 4 and 4 times: the
-limit belongs to the client, not to the instance that happens to answer.
-
-Caddy overwrites `X-Real-IP` with the address it sees. A test that sent a
-different `X-Real-IP` with every request was still limited as a single client,
-so the header cannot be used to dodge the limit.
-
-**Stampede protection is per instance.** `singleflight` only merges misses
-inside one process. Removing a hot link from the cache and sending 300
-requests, 100 at a time, gave between 1 and 5 misses over the three instances,
-never more than 2 on one.
-
-**Stopping an instance loses no requests.** Four clients sent a redirect and a
-create in a loop for 30 seconds, 5,842 requests in all. During that time one
-instance was stopped with `SIGTERM`, another killed with `SIGKILL`, and both
-were started again. No request failed. The slowest took 290 ms, at the moment
-of the stop: Caddy could not reach the stopping instance and retried on
-another after its default `lb_try_interval` of 250 ms. An instance that gets
-`SIGTERM` finishes the requests it has, flushes the click counts and exits.
-
-**Clicks are counted once.** Those 2,921 redirects all went to one link, and
-after the next flush it had 2,921 clicks in Postgres. Pending counts are kept
-in Redis, not in the process, so killing an instance loses none of them, except
-for a batch it has taken from Redis and not written yet. Two instances
-flushing at once can update the same rows in different orders and deadlock;
-Postgres then aborts one, whose counts go back to Redis. That did not happen
-here: `pg_stat_database.deadlocks` stayed at 0.
-
-Metrics are per instance. Prometheus has to scrape each instance, not the load
-balancer, which would return a different instance's numbers on each scrape.
-
-### Redis Cluster
-
-With several addresses in `REDIS_ADDR` and no `REDIS_MASTER`, the app uses a
-Redis Cluster client. The key space is split into 16,384 slots, each owned by
-one primary, and a key's slot is a hash of its name. `compose.cluster.yaml`
-runs three primaries with one replica each, and `GET`s go to the replicas.
-
-Every key the app uses is a single key, so no command spans slots. Each
-`MULTI` touches one key too. A first version of the sharded click flush put
-all 16 shards in one pipeline, which go-redis rejects in a cluster with
-`CROSSSLOT`; the single-node tests could not show that.
-
-#### The click hash was one hot slot
-
-A key lives on one node, and all clicks went to one key. 300 redirects over
-10 links, with three app instances:
-
-| Node      | `GET` before | `HINCRBY` before | `HINCRBY` after sharding |
-| --------- | ------------ | ---------------- | ------------------------ |
-| primary 1 |              | 0                | 97                       |
-| primary 2 |              | 0                | 91                       |
-| primary 3 |              | 300              | 112                      |
-| replica 1 | 120          |                  |                          |
-| replica 2 | 90           |                  |                          |
-| replica 3 | 90           |                  |                          |
-
-The `GET`s spread because the codes hash to different slots. The click counts
-did not, so one primary took every click write however many shards the
-cluster had. They now go to one of 16 hashes, picked at random for every
-click. Picking by code would spread different links but not the clicks of one
-popular link, which is the case that matters.
-
-#### Failover
-
-Stopping one primary while four clients sent redirects in a loop, to 10 links
-spread over all shards, showed four problems, fixed one at a time and checked
-by running the test again.
-
-1. **The client kept using the dead node.** The cluster promoted the replica,
-   but the app sent commands to the stopped node until the end of the test,
-   26 seconds later. go-redis reloads the slot map after a `MOVED` reply or
-   every 60 seconds. A command to a stopped node gets neither: it runs out of
-   its 300 ms budget. The map is now reloaded every 2 seconds.
-2. **The reload was stuck.** It runs in the background with no deadline and
-   asks the nodes for the slot map in random order. When it picked the stopped
-   node, the default dial settings spent 5 attempts of 5 seconds on it before
-   trying the next. Dialing now gives up after 200 ms with no retry. After
-   that, the last error came 0.5 seconds after the promotion.
-3. **The whole cluster stopped.** From the moment the primary was marked as
-   failed until the promotion, every node answered every command with
-   `CLUSTERDOWN`, also for the slots of the two healthy primaries. That is
-   `cluster-require-full-coverage yes`, the default. For a cache, the healthy
-   shards should keep serving, so the compose setup sets it to `no`.
-4. **Redirects waited for the click.** While a shard had no primary, one click
-   in three went to it and used the whole budget before the redirect was sent.
-   Redirects fell from about 200 a second to 40. The click is now counted in a
-   goroutine of its own.
-
-The last round, with all of that in place:
-
-- The cluster marked the primary as failed and promoted its replica about 8
-  seconds after the stop (`cluster-node-timeout` is 5 seconds).
-- All 7,690 redirects returned `302`. Throughput stayed between 213 and 245
-  a second, and the slowest redirect took 60 ms.
-- 843 of 7,700 clicks were lost: those that went to the shard without a
-  primary, before the promotion. The app logged 853 failed click writes.
-- The last error came 1.3 seconds after the promotion.
-
-### Redirect status
-
-Redirects use `302`. Browsers cache a `301` indefinitely, so later clicks would
-never reach the server and would not be counted, and an expired link would keep
-working for anyone who had opened it.
-
-## Metrics
-
-| Metric                                        | Labels          |
-| --------------------------------------------- | --------------- |
-| `redshortener_cache_lookups_total`            | `result`: `hit`, `negative_hit`, `miss`, `error` |
-| `redshortener_clicks_flushed_total`           |                 |
-| `redshortener_http_request_duration_seconds`  | `route`, `code` |
-
-The cache hit ratio is `hit / (hit + miss)`. The route label is the matched
-pattern, such as `GET /{code}`, so it does not grow with the number of links.
+- **Redirect.** `GET link:{code}` in Redis. On a miss, read Postgres and cache
+  the URL for 24 h ±10%, so entries cached together do not expire together.
+- **Unknown codes** are cached as "not found" for 60 s, so probing random codes
+  does not hit Postgres. Creating a link overwrites that entry; lookups write
+  it with `SET NX`, so a late "not found" cannot hide a new link.
+- **Stampede.** Concurrent misses on one code share one query (`singleflight`).
+- **Clicks** never touch Postgres on the redirect. Each one is an `HINCRBY` on
+  one of 16 hashes. Every 10 s each instance takes a hash with
+  `MULTI { HGETALL, DEL }`, waits for a replica with `WAIT`, and writes all
+  counts in one `UPDATE`. A click is counted at most once.
+- **Codes and aliases** share the primary key, so `INSERT ... ON CONFLICT`
+  settles duplicates, with no check-then-insert race.
+- **Redis down.** Each Redis command gets 300 ms in total; after that, lookups
+  go to Postgres.
+- **Postgres replica.** A row missing on the replica is read again from the
+  primary, so a new link is never cached as "not found".
+- **`302`, not `301`**: browsers cache a `301` forever, so clicks would not be
+  counted and expired links would keep working.
+
+## What the experiments showed
+
+Each line is a measurement; the scripts are in [`experiments/`](experiments/).
+
+| Test                                                | Result                                                  |
+| --------------------------------------------------- | ------------------------------------------------------- |
+| Read a Redis replica right after a write            | 0 stale reads out of 10,000                             |
+| Read a Postgres replica right after an insert       | 1,995 of 2,000 rows not there yet (about 1 ms behind)    |
+| Stop the Redis primary (Sentinel)                   | no failed request; writes slow for about 6 s            |
+| Stop a Redis Cluster primary                        | all 7,690 redirects `302`; 843 of 7,700 clicks lost     |
+| Kill the Postgres primary (Patroni)                 | all 8,600 redirects `302`; creates fail for 19 s; 0 links lost |
+| Stop etcd under Patroni                             | writes continue with `failsafe_mode`, all fail without it |
+| Stop and kill app instances behind Caddy            | 0 of 5,842 requests failed                              |
+| Fill Redis until it evicts                          | `volatile-lfu` kept 16 of 16 click hashes, `allkeys-lru` 7 |
+
+## Bugs the experiments found
+
+- `NewUniversalClient` with `MasterName` and `ReadOnly` sends writes to
+  replicas, and they fail. `NewFailoverClusterClient` routes per command.
+- go-redis timeouts multiply: 5 dial retries per attempt kept one create
+  waiting over 10 s. Fixed with one 300 ms deadline per command.
+- After a Cluster failover, go-redis kept using the dead node until the test
+  ended, 26 s later: it reloads the slot map every 60 s. Fixed with a reload
+  every 2 s and a 200 ms dial timeout.
+- With `cluster-require-full-coverage yes`, one dead primary stops the whole
+  cluster. A cache wants `no`.
+- One click hash put every click on one Cluster node; hence 16 random hashes.
+  A `MULTI` over all of them fails with `CROSSSLOT`; hence one per hash.
+- Redirects waited for the click write and slowed from 200 to 40 a second
+  during a failover. The click is now written in the background.
+- `WAIT` only counts writes made on its own connection, so it must run on the
+  connection that ran the `MULTI`.
+- `/readyz` checked only Postgres, so every instance reported unready during a
+  Postgres failover while redirects worked fine.
+- Patroni refuses a `ttl` under 20 s, and a new replica waited minutes for a
+  spread checkpoint until `basebackup: checkpoint: fast`.
+
+## Left out
+
+- Cross-instance stampede protection (leases, XFetch). A load is a 1 ms lookup
+  by primary key, so there is little to save.
+- Three etcd nodes and network partition tests. Everything runs on one Docker
+  host.
 
 ## Development
 
@@ -675,39 +133,13 @@ DATABASE_URL=postgres://redshortener:redshortener@localhost:5432/redshortener \
 REDIS_ADDR=localhost:6379 go test -race ./...
 ```
 
-Without the two variables, only the tests that need no database run.
-`TestReadAfterCreate` also needs `DATABASE_READ_URL`, pointing to a replica of
-the same database; CI has no replica and skips it.
-
-The measurements in this README can be repeated with the programs and scripts
-in [`experiments/`](experiments/README.md).
-
-## Roadmap
-
-- v0.2: Redis Sentinel, with redirects read from Redis replicas. Done.
-- v0.3: a Postgres streaming replica for reads, and the read-your-writes
-  problem it brings. Done.
-- v0.4: several app instances behind Caddy. Done.
-- v0.5: Redis Cluster. Done.
-- v1.0: the experiments behind these numbers, in `experiments/`, so that they
-  can be run again. Done.
-- v1.1: `WAIT` after the click flush, and Postgres failover with Patroni.
-  Done.
-- v1.2: custom aliases. Done.
-
 ## References
 
-- Nishtala et al., [Scaling Memcache at Facebook](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala), NSDI 2013. Leases, stale sets and thundering herds.
-- Vattani, Chierichetti, Lowenstein, [Optimal Probabilistic Cache Stampede Prevention](https://doi.org/10.14778/2757807.2757813), PVLDB 8(8), 2015.
-- Redis, [Key eviction](https://redis.io/docs/latest/develop/reference/eviction/).
-- Redis, [Replication](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/), including the safety of replication when the primary has persistence turned off.
-- Redis, [High availability with Sentinel](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/).
-- Redis, [Cluster specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/) and [scaling with Redis Cluster](https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/).
-- PostgreSQL, [Log-Shipping Standby Servers](https://www.postgresql.org/docs/current/warm-standby.html) and [synchronous_commit](https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT).
-- PostgreSQL, [libpq connection parameters](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-TARGET-SESSION-ATTRS), for `target_session_attrs` and multiple hosts.
-- Patroni, [replication modes](https://patroni.readthedocs.io/en/latest/replication_modes.html) and [DCS failsafe mode](https://patroni.readthedocs.io/en/latest/dcs_failsafe_mode.html).
-- Redis, [WAIT](https://redis.io/docs/latest/commands/wait/).
-- PostgreSQL, [Heap-Only Tuples](https://www.postgresql.org/docs/current/storage-hot.html).
+- Nishtala et al., [Scaling Memcache at Facebook](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala), NSDI 2013.
+- Vattani et al., [Optimal Probabilistic Cache Stampede Prevention](https://doi.org/10.14778/2757807.2757813), PVLDB 2015.
+- Redis: [replication](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/), [Sentinel](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/), [Cluster spec](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/), [eviction](https://redis.io/docs/latest/develop/reference/eviction/), [WAIT](https://redis.io/docs/latest/commands/wait/).
+- PostgreSQL: [standby servers](https://www.postgresql.org/docs/current/warm-standby.html), [`target_session_attrs`](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-TARGET-SESSION-ATTRS).
+- Patroni: [replication modes](https://patroni.readthedocs.io/en/latest/replication_modes.html), [failsafe mode](https://patroni.readthedocs.io/en/latest/dcs_failsafe_mode.html).
 
 ## License
 
