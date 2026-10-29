@@ -4,6 +4,7 @@
 #
 #   experiments/failover.sh sentinel   stops the Redis primary behind Sentinel
 #   experiments/failover.sh cluster    stops one Redis Cluster primary
+#   experiments/failover.sh postgres   kills the Postgres primary under Patroni
 #   experiments/failover.sh app        stops one app instance, kills another
 #
 # Run it from the repository root, with COMPOSE_FILE naming the compose files
@@ -12,10 +13,11 @@
 set -euo pipefail
 export LC_ALL=C
 
-mode=${1:?usage: experiments/failover.sh sentinel|cluster|app}
+mode=${1:?usage: experiments/failover.sh sentinel|cluster|postgres|app}
 url=${URL:-http://localhost:8080}
 out=$(mktemp)
-trap 'rm -f "$out"' EXIT
+created=$(mktemp)
+trap 'rm -f "$out" "$created"' EXIT
 
 ip_of() { docker compose exec -T "$1" hostname -i | tr -d '\r'; }
 
@@ -32,6 +34,13 @@ redis_primary() {
 			docker compose exec -T node$n redis-cli role 2>/dev/null | head -1 | grep -q master && echo node$n && return
 		done ;;
 	esac
+}
+
+postgres_primary() {
+	for s in postgres postgres2 postgres3; do
+		docker compose exec -T $s patronictl -c /etc/patroni.yaml list -f tsv 2>/dev/null |
+			awk -F'\t' '$4 == "Leader" {print $2; found = 1} END {exit !found}' && return
+	done
 }
 
 # Creating links is rate limited to 10 at once, then one a second.
@@ -52,6 +61,17 @@ client() {
 }
 for _ in 1 2 3 4; do client & done
 
+# One create a second, which is what the rate limit allows.
+writer() {
+	local end=$(($(date +%s) + 35))
+	while [ "$(date +%s)" -lt $end ]; do
+		r=$(curl -s -X POST -w '%{http_code}' "$url/api/links" -d '{"url":"https://example.com/"}')
+		echo "$(date +%s) ${r: -3} $(sed -nE 's/.*"code":"([^"]+)".*/\1/p' <<<"$r")" >>"$created"
+		sleep 1
+	done
+}
+[ "$mode" = postgres ] && writer &
+
 start=$(date +%s)
 since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 sleep 5
@@ -60,6 +80,10 @@ sentinel | cluster)
 	target=$(redis_primary)
 	echo "+5s stopping Redis primary $target"
 	docker compose stop "$target" >/dev/null 2>&1 ;;
+postgres)
+	target=$(postgres_primary)
+	echo "+5s killing Postgres primary $target (SIGKILL)"
+	docker compose kill "$target" >/dev/null 2>&1 ;;
 app)
 	apps=($(docker compose ps -q app))
 	echo "+5s stopping one app instance (SIGTERM)"
@@ -84,6 +108,17 @@ echo
 echo "errors the app logged, by message:"
 docker compose logs --since "$since" app 2>/dev/null | grep -oE '"level":"(WARN|ERROR)","msg":"[^"]+' |
 	sed -E 's/.*"msg":"//' | sort | uniq -c | sort -rn || true
+if [ "$mode" = postgres ]; then
+	echo
+	echo "creates per second, by status:"
+	awk -v t="$start" '{printf "+%ss %s   ", $1 - t, $2} NR % 8 == 0 {print ""}' "$created"
+	echo
+	lost=0
+	for c in $(awk '$2 == 201 {print $3}' "$created"); do
+		[ "$(curl -s -o /dev/null -w '%{http_code}' "$url/api/links/$c")" = 200 ] || lost=$((lost + 1))
+	done
+	echo "created links missing afterwards: $lost of $(awk '$2 == 201 {n++} END {print n + 0}' "$created")"
+fi
 if [ "$mode" != app ]; then
 	echo
 	echo "start $target again with: docker compose start $target"
