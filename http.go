@@ -33,17 +33,24 @@ var requestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 // limiting come from ipHeader when it is set, and from the TCP connection
 // otherwise.
 func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
-	// 10 links at once, then one a second, per client address.
-	limit := redlimit.Middleware(redlimit.NewTokenBucket(links.rdb, 1, 10), func(r *http.Request) string {
+	clientIP := func(r *http.Request) string {
 		if ip := r.Header.Get(ipHeader); ipHeader != "" && ip != "" {
 			return ip
 		}
 		host, _, _ := net.SplitHostPort(r.RemoteAddr)
 		return host
-	})
+	}
+	// 10 links at once, then one a second, per client address.
+	limit := redlimit.Middleware(redlimit.NewTokenBucket(links.rdb, 1, 10), clientIP)
+
+	// Stats are read from Postgres on every request, so they get a limit of
+	// their own: 10 a second, 100 at once.
+	readLimit := redlimit.Middleware(redlimit.NewTokenBucket(links.rdb, 10, 100, redlimit.Prefix("rl-read")), clientIP)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		// The page only talks to this server, and must not be framed.
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write(indexHTML)
 	})
@@ -92,7 +99,7 @@ func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
 		}{link, base.JoinPath(link.Code).String()})
 	})))
 
-	mux.HandleFunc("GET /api/links/{code}", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /api/links/{code}", readLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		code := r.PathValue("code")
 		if !validCode(code) {
 			writeError(w, http.StatusNotFound, errNotFound.Error())
@@ -109,7 +116,7 @@ func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, link)
-	})
+	})))
 
 	mux.HandleFunc("GET /{code}", func(w http.ResponseWriter, r *http.Request) {
 		code := r.PathValue("code")
@@ -146,8 +153,10 @@ func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
 		if perr == nil {
 			return
 		}
+		// The errors name hosts and users, so they go to the log only.
 		if rerr := links.rdb.Ping(r.Context()).Err(); rerr != nil {
-			http.Error(w, "postgres: "+perr.Error()+"\nredis: "+rerr.Error(), http.StatusServiceUnavailable)
+			slog.ErrorContext(r.Context(), "not ready", "postgres", perr, "redis", rerr)
+			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 	})
 	mux.Handle("GET /metrics", promhttp.Handler())
