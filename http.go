@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -114,7 +115,9 @@ func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		links.Hit(r.Context(), code)
+		// Counting the click must not delay the redirect. When the Redis node
+		// holding its hash is down, the write takes the whole 300 ms budget.
+		go links.Hit(context.WithoutCancel(r.Context()), code)
 		// 302, not 301: browsers cache a 301 forever, so later clicks would
 		// not be counted and an expired link would keep redirecting.
 		http.Redirect(w, r, target, http.StatusFound)
