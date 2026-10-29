@@ -57,14 +57,21 @@ func run() error {
 		defer ro.Close()
 	}
 
+	// The hook added below bounds each command, but not what the client does
+	// in the background without a deadline, such as reloading the cluster
+	// slot map. A short dial timeout with a single attempt keeps a dead node
+	// from holding that up for the default 5 attempts of 5 seconds.
 	opts := &redis.UniversalOptions{
 		Addrs:                 strings.Split(env("REDIS_ADDR", "localhost:6379"), ","),
 		MasterName:            os.Getenv("REDIS_MASTER"),
 		MaxRetries:            1,
+		DialTimeout:           200 * time.Millisecond,
+		DialerRetries:         1,
 		ContextTimeoutEnabled: true,
 	}
 	var rdb redis.UniversalClient
-	if opts.MasterName != "" {
+	switch {
+	case opts.MasterName != "":
 		// Through Sentinel, with read-only commands such as GET sent to a
 		// replica and everything else to the primary. It has to be a
 		// failover cluster client: NewUniversalClient with ReadOnly would
@@ -72,12 +79,19 @@ func run() error {
 		fo := opts.Failover()
 		fo.ReplicaOnly = true
 		rdb = redis.NewFailoverClusterClient(fo)
-	} else {
-		// With several addresses this is a Redis Cluster client, and ReadOnly
-		// sends read-only commands to the replicas of each slot. A single
-		// address gives a plain client, which ignores it.
-		opts.ReadOnly = true
-		rdb = redis.NewUniversalClient(opts)
+	case len(opts.Addrs) > 1:
+		// Redis Cluster, with read-only commands sent to the replicas of each
+		// slot. The client only reloads the slot map after a MOVED reply or
+		// every ClusterStateReloadInterval, 60s by default. A command to a dead
+		// primary times out instead of getting MOVED, so without a short
+		// interval the client kept using the dead node for a minute after a
+		// replica had taken over.
+		co := opts.Cluster()
+		co.ReadOnly = true
+		co.ClusterStateReloadInterval = 2 * time.Second
+		rdb = redis.NewClusterClient(co)
+	default:
+		rdb = redis.NewClient(opts.Simple())
 	}
 	rdb.AddHook(redisBudget(300 * time.Millisecond))
 	defer rdb.Close()
