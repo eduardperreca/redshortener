@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"strconv"
@@ -41,32 +42,24 @@ func (l *Links) Hit(ctx context.Context, code string) {
 
 // flushClicks moves the pending counts from Redis to Postgres.
 //
-// For each hash, HGETALL and DEL run in one MULTI, so when several instances
-// flush at once, each count is taken by exactly one of them. If the MULTI
-// fails for some hashes, the counts taken from the others are still written.
-// If Postgres rejects the batch, the counts go back into Redis for the next
-// flush. If the process dies between taking the counts and writing them, they
-// are lost: a click is counted at most once.
+// Each hash is emptied with takeClicks, so when several instances flush at
+// once, each count is taken by exactly one of them. If that fails for some
+// hashes, the counts taken from the others are still written. If Postgres
+// rejects the batch, the counts go back into Redis for the next flush. If the
+// process dies between taking the counts and writing them, they are lost: a
+// click is counted at most once.
 func (l *Links) flushClicks(ctx context.Context) error {
-	// One MULTI per hash: in a Redis Cluster, a MULTI can only use keys of
-	// one slot, and go-redis rejects the whole pipeline otherwise.
-	//
 	// The same code can be pending in several hashes. UPDATE ... FROM would
 	// apply only one of its rows, so the counts are summed first.
 	sum := map[string]int64{}
 	var rerr error
 	for i := range clickShards {
-		var pending *redis.MapStringStringCmd
-		_, err := l.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
-			pending = p.HGetAll(ctx, clicksKey(i))
-			p.Del(ctx, clicksKey(i))
-			return nil
-		})
+		pending, err := l.takeClicks(ctx, clicksKey(i))
 		if err != nil {
 			rerr = errors.Join(rerr, err)
 			continue
 		}
-		for code, s := range pending.Val() {
+		for code, s := range pending {
 			n, _ := strconv.ParseInt(s, 10, 64)
 			sum[code] += n
 		}
@@ -102,6 +95,51 @@ func (l *Links) flushClicks(ctx context.Context) error {
 	}
 	clicksFlushed.Add(float64(total))
 	return rerr
+}
+
+// takeClicks empties one pending hash with MULTI { HGETALL, DEL } and returns
+// its counts once a replica has the DEL.
+//
+// If the primary died before a replica got the DEL, the replica would still
+// have the counts after it was promoted, and they would be flushed twice.
+// WAIT asks the primary how many replicas have every write of this connection
+// so far, so the MULTI and the WAIT must share a connection. If the primary is
+// gone before it answers, the counts are dropped: either the replica still has
+// them, or they are lost, and in both cases no click is counted twice.
+//
+// A WAIT that times out still lets the counts through. Without replicas it
+// always does, after 50 ms, and with replicas it means they are behind, not
+// that the primary is gone.
+func (l *Links) takeClicks(ctx context.Context, key string) (map[string]string, error) {
+	// One MULTI per hash: in a Redis Cluster, a MULTI can only use keys of
+	// one slot.
+	// Sentinel and Cluster clients are both ClusterClients here.
+	var primary *redis.Client
+	switch c := l.rdb.(type) {
+	case *redis.Client:
+		primary = c
+	case *redis.ClusterClient:
+		var err error
+		if primary, err = c.MasterForKey(ctx, key); err != nil {
+			return nil, err
+		}
+	}
+	conn := primary.Conn()
+	defer conn.Close()
+
+	var pending *redis.MapStringStringCmd
+	_, err := conn.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		pending = p.HGetAll(ctx, key)
+		p.Del(ctx, key)
+		return nil
+	})
+	if err != nil || len(pending.Val()) == 0 {
+		return nil, err
+	}
+	if err := conn.Wait(ctx, 1, 50*time.Millisecond).Err(); err != nil {
+		return nil, fmt.Errorf("dropped %d pending codes from %s: %w", len(pending.Val()), key, err)
+	}
+	return pending.Val(), nil
 }
 
 // background flushes clicks and deletes expired links until ctx is done,

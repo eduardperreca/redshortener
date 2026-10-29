@@ -213,8 +213,15 @@ FROM unnest($codes, $counts) AS c(code, n)
 WHERE links.code = c.code
 ```
 
+followed, on the same connection, by
+
+```
+WAIT 1 50
+```
+
 `MULTI` runs both commands with nothing in between, so when several instances
-flush at the same moment, each count is taken by exactly one of them. A code
+flush at the same moment, each count is taken by exactly one of them. `WAIT`
+is explained under [Failover](#failover). A code
 can be pending in several shards, so the counts are summed before the
 `UPDATE`, which would apply only one row per code otherwise. If the
 `UPDATE` fails, the counts go back into the hash with `HINCRBY` and the next
@@ -223,8 +230,9 @@ same rows in a different order: Postgres aborts one of them, and its counts are
 retried.
 
 The cost is that a click is counted at most once, not exactly once. Counts are
-lost if the process dies after taking them and before writing them, or if Redis
-loses the hash. Click counts shown by the API lag behind by up to 10 seconds.
+lost if the process dies after taking them and before writing them, if Redis
+loses the hash, or if they were sent to a Redis primary that failed before
+passing them on. Click counts shown by the API lag behind by up to 10 seconds.
 
 Why 16 shards, and why the redirect does not wait for the count, is explained
 under [Redis Cluster](#redis-cluster).
@@ -327,14 +335,30 @@ Stopping the primary while sending a redirect and a create every 100 ms:
   no longer does.
 - When the old primary came back, Sentinel made it a replica of the new one.
 
-Two things can go wrong in a failover that did not show in this test:
+Writes the old primary accepted but had not sent to a replica are lost. For
+the cache that means misses. For the click flush it could mean counting twice:
+if the primary answers `MULTI { HGETALL, DEL }` and dies before the `DEL`
+reaches a replica, the new primary still has the counts, and the next flush
+takes them again. So after the `MULTI` the app sends `WAIT 1 50`, which
+returns once one replica has every write made on that connection so far, or
+after 50 ms. The two must share a connection: `WAIT` sent on another one from
+the pool returns at once, because that connection wrote nothing. The app then:
 
-- Writes the old primary accepted but had not sent to a replica are lost. For
-  the cache that means misses. For the click flush it is worse: if the primary
-  answers `MULTI { HGETALL, DEL }` and dies before the `DEL` reaches a replica,
-  the new primary still has the counts, and they are flushed a second time.
-  `WAIT 1 <timeout>` after the flush would make the app wait for a replica to
-  confirm the `DEL`, which narrows this window but does not close it.
+- writes the counts to Postgres if `WAIT` answered, whatever the number. With
+  healthy replicas it answered 1 within a millisecond. 0 means no replica
+  confirmed in time; without replicas that is always the answer, after 50 ms.
+- drops the counts if the primary is gone before answering. Either the replica
+  has them and they are flushed after its promotion, or it does not and they
+  are lost. Neither counts a click twice.
+
+This closes the window only if the promoted replica is the one that
+confirmed: with two replicas, `WAIT 1` is satisfied by either of them. Sentinel
+promotes the replica with the most data, which is the one that confirmed
+unless the other caught up after. It was not reproduced here, because the
+window is a fraction of a millisecond wide.
+
+One more thing can go wrong in a failover that did not show in this test:
+
 - Redis runs without persistence here. If a primary restarts fast enough that
   Sentinel has not yet failed over, it comes back empty, and the replicas
   resync from it and empty themselves too. For a cache that means a cold start
