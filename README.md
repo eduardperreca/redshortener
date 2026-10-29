@@ -60,7 +60,8 @@ docker compose -f compose.yaml -f compose.cluster.yaml up -d --build
 ## API
 
 Create a link. `expires_in` is in seconds and optional; without it the link
-never expires.
+never expires. `alias` is optional too; without it the link gets a random
+code.
 
 ```sh
 curl -X POST localhost:8080/api/links -d '{"url": "https://go.dev/doc/", "expires_in": 3600}'
@@ -79,7 +80,7 @@ curl -X POST localhost:8080/api/links -d '{"url": "https://go.dev/doc/", "expire
 
 | Request                  | Response                                                     |
 | ------------------------ | ------------------------------------------------------------ |
-| `POST /api/links`        | `201` with the link, `400` with `{"error": ...}`, `429` when rate limited |
+| `POST /api/links`        | `201` with the link, `400` with `{"error": ...}`, `409` if the alias is taken, `429` when rate limited |
 | `GET /{code}`            | `302` to the URL, `404` if the code is unknown or expired    |
 | `GET /api/links/{code}`  | `200` with the link and its click count, `404`               |
 | `GET /healthz`           | `200` while the process is up                                |
@@ -119,8 +120,17 @@ A counter encoded in base 62 would give shorter codes and never collide, but
 anyone could walk through every link by counting. Random codes cannot be
 guessed and need no shared counter.
 
-Requests for anything that is not a well-formed code get a `404` before they
-reach Redis or Postgres.
+A link can have an alias instead, 3 to 32 characters from `[0-9A-Za-z_-]`,
+case-sensitive like the codes. Aliases and codes share the primary key, so
+there is nothing to check before the insert: of two requests for the same
+alias, Postgres lets one insert the row, and the other gets `409`. A check
+followed by an insert would let both pass the check. An alias whose link has
+expired can be taken again at once; the insert overwrites the old row instead
+of waiting for the hourly purge to delete it. `healthz`, `readyz` and
+`metrics` are refused, because those paths are routes of their own.
+
+Requests for anything that is not a well-formed code or alias get a `404`
+before they reach Redis or Postgres.
 
 ### Reading a link
 
@@ -683,6 +693,7 @@ in [`experiments/`](experiments/README.md).
   can be run again. Done.
 - v1.1: `WAIT` after the click flush, and Postgres failover with Patroni.
   Done.
+- v1.2: custom aliases. Done.
 
 ## References
 

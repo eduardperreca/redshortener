@@ -47,7 +47,7 @@ func TestCacheAside(t *testing.T) {
 	}
 
 	// A new link is cached on creation, with a TTL capped at its expiry.
-	link, err := l.Create(ctx, "https://example.com/", time.Hour)
+	link, err := l.Create(ctx, "https://example.com/", time.Hour, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,12 +65,34 @@ func TestCacheAside(t *testing.T) {
 	}
 }
 
+// An alias belongs to one live link at a time, and is free again once that
+// link has expired.
+func TestAlias(t *testing.T) {
+	l := newLinks(t)
+	ctx := context.Background()
+
+	alias := "my-" + newCode()
+	if _, err := l.Create(ctx, "https://example.com/a", time.Millisecond, alias); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if _, err := l.Create(ctx, "https://example.com/b", 0, alias); err != nil {
+		t.Fatalf("expired alias: %v", err)
+	}
+	if _, err := l.Create(ctx, "https://example.com/c", 0, alias); !errors.Is(err, errTaken) {
+		t.Fatalf("taken alias: got %v, want errTaken", err)
+	}
+	if got, err := l.Resolve(ctx, alias); err != nil || got != "https://example.com/b" {
+		t.Fatalf("resolve: got %q, %v", got, err)
+	}
+}
+
 // Ten instances flushing at once must count every click exactly once.
 func TestConcurrentFlush(t *testing.T) {
 	l := newLinks(t)
 	ctx := context.Background()
 
-	link, err := l.Create(ctx, "https://example.com/", 0)
+	link, err := l.Create(ctx, "https://example.com/", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +157,7 @@ func TestReadAfterCreate(t *testing.T) {
 	l.ro = ro
 
 	for range 100 {
-		link, err := l.Create(ctx, "https://example.com/", 0)
+		link, err := l.Create(ctx, "https://example.com/", 0, "")
 		if err != nil {
 			t.Fatal(err)
 		}

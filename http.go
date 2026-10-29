@@ -52,6 +52,7 @@ func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
 		var req struct {
 			URL       string `json:"url"`
 			ExpiresIn int64  `json:"expires_in"` // seconds; 0 never expires
+			Alias     string `json:"alias"`      // empty for a random code
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -68,7 +69,18 @@ func newHandler(links *Links, base *url.URL, ipHeader string) http.Handler {
 			return
 		}
 
-		link, err := links.Create(r.Context(), req.URL, expiresIn)
+		// These paths are routes of their own, so a link under them could
+		// never be reached.
+		if req.Alias != "" && (!validCode(req.Alias) || req.Alias == "healthz" || req.Alias == "readyz" || req.Alias == "metrics") {
+			writeError(w, http.StatusBadRequest, "alias must be 3 to 32 characters from 0-9, A-Z, a-z, - and _, and not healthz, readyz or metrics")
+			return
+		}
+
+		link, err := links.Create(r.Context(), req.URL, expiresIn, req.Alias)
+		if errors.Is(err, errTaken) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if err != nil {
 			slog.ErrorContext(r.Context(), "creating link", "err", err)
 			writeError(w, http.StatusInternalServerError, "could not create link")

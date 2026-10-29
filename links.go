@@ -26,7 +26,10 @@ const (
 	loadTimeout = 5 * time.Second
 )
 
-var errNotFound = errors.New("link not found")
+var (
+	errNotFound = errors.New("link not found")
+	errTaken    = errors.New("alias is taken")
+)
 
 var cacheLookups = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "redshortener_cache_lookups_total",
@@ -74,22 +77,33 @@ func (r replicaRow) Scan(dest ...any) error {
 	return err
 }
 
-// Create stores url under a new random code. A zero expiresIn means the link
-// never expires.
-func (l *Links) Create(ctx context.Context, url string, expiresIn time.Duration) (Link, error) {
+// Create stores url under alias, or under a new random code when alias is
+// empty. A zero expiresIn means the link never expires.
+func (l *Links) Create(ctx context.Context, url string, expiresIn time.Duration, alias string) (Link, error) {
 	var secs *float64
 	if expiresIn > 0 {
 		s := expiresIn.Seconds()
 		secs = &s
 	}
 	for range 3 {
-		link := Link{Code: newCode(), URL: url}
+		link := Link{Code: alias, URL: url}
+		if alias == "" {
+			link.Code = newCode()
+		}
+		// The primary key decides who gets a code, so two requests for the
+		// same alias cannot both succeed. A code whose link has expired but
+		// not been deleted yet is taken over.
 		err := l.db.QueryRow(ctx, `
 			INSERT INTO links (code, url, expires_at)
 			VALUES ($1, $2, now() + make_interval(secs => $3))
-			ON CONFLICT (code) DO NOTHING
+			ON CONFLICT (code) DO UPDATE
+				SET url = excluded.url, created_at = now(), expires_at = excluded.expires_at, clicks = 0
+				WHERE links.expires_at <= now()
 			RETURNING created_at, expires_at`, link.Code, url, secs).Scan(&link.CreatedAt, &link.ExpiresAt)
 		if errors.Is(err, pgx.ErrNoRows) {
+			if alias != "" {
+				return Link{}, errTaken
+			}
 			continue // the code is taken
 		}
 		if err != nil {
@@ -216,10 +230,11 @@ func newCode() string {
 	return string(code)
 }
 
-// validCode reports whether code could have been made by newCode. Anything
-// else is rejected before it reaches Redis or Postgres.
+// validCode reports whether code is a generated code or a valid alias: 3 to
+// 32 characters from the alphabet, '-' and '_'. Anything else is rejected
+// before it reaches Redis or Postgres.
 func validCode(code string) bool {
-	return len(code) == codeLen && strings.Trim(code, alphabet) == ""
+	return len(code) >= 3 && len(code) <= 32 && strings.Trim(code, alphabet+"-_") == ""
 }
 
 func checkURL(raw string, self *url.URL) error {
