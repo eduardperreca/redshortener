@@ -348,9 +348,13 @@ AOF. Nothing in it needs to survive a restart except the pending click counts,
 and losing those is accepted above.
 
 The eviction policy is `volatile-lfu`. It only evicts keys that have a TTL,
-which keeps `clicks:pending` safe, and it prefers to evict rarely used links
-over recently used ones, which suits traffic where a few links get most of the
-clicks.
+which keeps the pending click hashes safe, and it prefers to evict rarely used
+links over recently used ones, which suits traffic where a few links get most
+of the clicks.
+
+Filling a 4 MB Redis with 40,000 cached links evicted about 18,000 keys under
+either policy. Under `volatile-lfu` all 16 click hashes were still there;
+under `allkeys-lru`, 7 were.
 
 ### Postgres
 
@@ -562,6 +566,9 @@ Without the two variables, only the tests that need no database run.
 `TestReadAfterCreate` also needs `DATABASE_READ_URL`, pointing to a replica of
 the same database; CI has no replica and skips it.
 
+The measurements in this README can be repeated with the programs and scripts
+in [`experiments/`](experiments/README.md).
+
 ## Roadmap
 
 - v0.2: Redis Sentinel, with redirects read from Redis replicas. Done.
@@ -569,7 +576,8 @@ the same database; CI has no replica and skips it.
   problem it brings. Done.
 - v0.4: several app instances behind Caddy. Done.
 - v0.5: Redis Cluster. Done.
-- v1.0: failover experiments, written up in `docs/`.
+- v1.0: the experiments behind these numbers, in `experiments/`, so that they
+  can be run again. Done.
 
 ## References
 
