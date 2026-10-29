@@ -185,6 +185,17 @@ N queries. Two known ways to go further were left out:
   refresh an entry before it expires, with a probability that rises as expiry
   approaches. Hot keys are refreshed before they miss, without coordination.
 
+Both pay off when loading an entry is slow, and here it is a lookup by primary
+key that takes about a millisecond. A stampede costs what arrives while the
+query runs: at 1,000 requests a second on one link, about one request per
+instance waits, once a day when the entry expires. XFetch refreshes a request
+early with probability e^(-r/βδ), where r is the time left and δ the time a
+load takes, so with δ = 1 ms it only acts in the last few milliseconds of a
+24 hour TTL. At 1,000 requests a second and β = 1, it refreshes ahead of
+expiry about 63% of the time, and the misses it saves the other times are the
+same one query per instance. A lease would turn up to N queries into one, but
+adds a round trip to every miss to take the lease.
+
 The shared query runs with its own 5 second timeout instead of the first
 caller's context, because if that client disconnects, the others waiting on
 the same query should not fail with it.
