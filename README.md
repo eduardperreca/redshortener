@@ -37,13 +37,21 @@ curl -X POST localhost:8080/api/links -d '{"url": "https://go.dev", "alias": "go
 ```
 
 `alias` and `expires_in` (seconds) are optional. Without an alias the link
-gets a random 7-character code.
+gets a random 7-character code. The response includes a `token`, shown only
+once, that changes or deletes the link:
+
+```sh
+curl -X PATCH localhost:8080/api/links/go -H "Authorization: Bearer $TOKEN" -d '{"url": "https://go.dev/doc"}'
+curl -X DELETE localhost:8080/api/links/go -H "Authorization: Bearer $TOKEN"
+```
 
 | Request                 | Response                                                        |
 | ----------------------- | --------------------------------------------------------------- |
 | `POST /api/links`       | `201` link, `400` bad input, `409` alias taken, `429` rate limited |
 | `GET /{code}`           | `302` to the URL, `404`                                         |
 | `GET /api/links/{code}` | `200` link with click count, `404`                              |
+| `PATCH /api/links/{code}` | `204`, `404` if unknown or wrong token, `503` retry           |
+| `DELETE /api/links/{code}` | `204`, `404` if unknown or wrong token, `503` retry          |
 | `GET /healthz`          | `200` while the process runs                                    |
 | `GET /readyz`           | `200` if Postgres or Redis answers                              |
 | `GET /metrics`          | Prometheus                                                      |
@@ -74,6 +82,12 @@ gets a random 7-character code.
   counts in one `UPDATE`. A click is counted at most once.
 - **Codes and aliases** share the primary key, so `INSERT ... ON CONFLICT`
   settles duplicates, with no check-then-insert race.
+- **Changing a link.** Only the SHA-256 of the token is stored. Writers
+  `SET` the cache entry, lookups fill it with `SET NX`, so a lookup that read
+  the old URL cannot cache it after the change. The `SET` runs before the
+  commit, under the row lock: concurrent changes reach Redis in commit order,
+  and if Redis fails the change rolls back (`503`, retry). Deleting makes the
+  link expire now, which frees an alias at once.
 - **Redis down.** Each Redis command gets 300 ms in total; after that, lookups
   go to Postgres.
 - **Postgres replica.** A row missing on the replica is read again from the
